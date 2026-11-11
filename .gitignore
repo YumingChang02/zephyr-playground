@@ -1,0 +1,41 @@
+# ==========================================
+# Zephyr Multi-Board Workspace .gitignore
+# ==========================================
+
+# Shared Zephyr Tree (Managed independently by west / git)
+zephyrproject/
+
+# Python Virtual Environment & Artifacts
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Zephyr & CMake Build Artifacts (any depth)
+**/build*/
+**/twister-out*/
+*.bin
+*.elf
+*.hex
+*.map
+*.uf2
+*.dts.pre.tmp
+compile_commands.json
+.ninja_*
+*.ninja
+
+# Cache directories
+.cache/
+.west/
+
+# Editor & IDE Directories
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
