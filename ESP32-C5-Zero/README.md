@@ -20,7 +20,7 @@ The **ESP32-C5-Zero** is an ultra-compact mini development board based on the Es
 
 - **Target Identifier**: `esp32c5_devkitc/esp32c5/hpcore`
 - **Architecture**: RISC-V 32-bit (`riscv64-zephyr-elf` toolchain)
-- **Devicetree Overlay ([app/app.overlay](file:///home/markchang/zephyr/ESP32-C5-Zero/app/app.overlay))**:
+- **Devicetree Overlay ([app/app.overlay](file:///home/markchang/zephyr-playground/ESP32-C5-Zero/app/app.overlay))**:
   - Directs serial console to native USB Serial/JTAG (`zephyr,console = &usb_serial;`)
   - Configures Timer Group 0 (`&timer0` -> `counter`) and maps it to the portable `app-timer` alias
 
@@ -88,7 +88,7 @@ Wi-Fi credentials are kept private and out of version control using `credentials
 
 ## Building and Flashing
 
-From inside `/home/markchang/zephyr/ESP32-C5-Zero`:
+From inside `~/zephyr-playground/ESP32-C5-Zero`:
 
 ### 1. Build
 ```bash

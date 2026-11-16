@@ -2,25 +2,25 @@
 
 ## Python & Package Management
 - **Always use `uv` directly (`uv run ...`)** to execute commands and tools. Never mutate the user's `PATH` or add `.venv/bin` to shell paths (`fish_add_path` or `export PATH`).
-- The shared Python workspace is located at the root `/home/markchang/zephyr/` with `pyproject.toml`, `uv.lock`, and `.venv`.
+- The shared Python workspace is located at the root `~/zephyr-playground/` with `pyproject.toml`, `uv.lock`, and `.venv`.
 - To sync dependencies:
   ```bash
-  cd /home/markchang/zephyr
+  cd ~/zephyr-playground
   uv sync
   ```
 - To run commands inside any project subfolder (e.g. `ESP32-S3-GEEK`, `ESP32-C6-LCD-1.47`):
   ```bash
   uv run west <command>
   ```
-  `uv` automatically discovers the parent workspace (`/home/markchang/zephyr`) and its `.venv`.
+  `uv` automatically discovers the parent workspace (`~/zephyr-playground`) and its `.venv`.
 
 ## Zephyr Development Workflow
 - **Workspace Layout**:
-  - Shared Zephyr tree: `/home/markchang/zephyr/zephyrproject`
-  - Shared Python virtualenv & tools: `/home/markchang/zephyr/.venv`
-  - Board / App directories: `/home/markchang/zephyr/ESP32-S3-GEEK`, `/home/markchang/zephyr/ESP32-C5-Zero`, etc.
+  - Shared Zephyr tree: `~/zephyr-playground/zephyrproject`
+  - Shared Python virtualenv & tools: `~/zephyr-playground/.venv`
+  - Board / App directories: `~/zephyr-playground/ESP32-S3-GEEK`, `~/zephyr-playground/ESP32-C5-Zero`, etc.
 - **Environment**:
-  - `ZEPHYR_BASE` is set in `~/.config/fish/conf.d/zephyr.fish` (`set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr`).
+  - `ZEPHYR_BASE` is set in `~/.config/fish/conf.d/zephyr.fish` (`set -gx ZEPHYR_BASE $HOME/zephyr-playground/zephyrproject/zephyr`).
 - **Toolchains (`west sdk`)**:
   - Check installed: `uv run west sdk list`
   - Install specific toolchain: `uv run west sdk install -t <toolchain>` (e.g., `xtensa-espressif_esp32s3_zephyr-elf`, `riscv64-zephyr-elf`)

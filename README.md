@@ -1,13 +1,13 @@
 # Zephyr Multi-Board Workspace
 
-This repository is a unified Zephyr workspace and Python environment located at `/home/markchang/zephyr`. It supports building and flashing across multiple hardware boards using a single shared Python virtual environment and Zephyr tree.
+This repository is a unified Zephyr workspace and Python environment located at `~/zephyr-playground`. It supports building and flashing across multiple hardware boards using a single shared Python virtual environment and Zephyr tree.
 
 ---
 
 ## Workspace Structure
 
 ```text
-/home/markchang/zephyr/
+~/zephyr-playground/
 ├── pyproject.toml                  <-- Shared uv package configuration
 ├── uv.lock                         <-- Shared lockfile
 ├── .venv/                          <-- Shared Python virtual environment
@@ -51,17 +51,17 @@ This repository is a unified Zephyr workspace and Python environment located at 
 ## Environment & Tool Execution Rules
 
 - **Always run commands via `uv run`**:
-  Do not manually add `.venv/bin` to `PATH`. When you run `uv run west <command>` inside any project subfolder, `uv` automatically walks up the directory tree to find and use `/home/markchang/zephyr/.venv`.
+  Do not manually add `.venv/bin` to `PATH`. When you run `uv run west <command>` inside any project subfolder, `uv` automatically walks up the directory tree to find and use `~/zephyr-playground/.venv`.
 - **Environment Variables (`ZEPHYR_BASE` & `ZEPHYR_SDK_INSTALL_DIR`)**:
   Configured in `~/.config/fish/conf.d/zephyr.fish`:
   ```fish
-  set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr
-  set -gx ZEPHYR_SDK_INSTALL_DIR /home/markchang/zephyr/zephyr-sdk
+  set -gx ZEPHYR_BASE $HOME/zephyr-playground/zephyrproject/zephyr
+  set -gx ZEPHYR_SDK_INSTALL_DIR $HOME/zephyr-playground/zephyr-sdk
   ```
   In bash / sh (`~/.bashrc`):
   ```bash
-  export ZEPHYR_BASE="/home/markchang/zephyr/zephyrproject/zephyr"
-  export ZEPHYR_SDK_INSTALL_DIR="/home/markchang/zephyr/zephyr-sdk"
+  export ZEPHYR_BASE="$HOME/zephyr-playground/zephyrproject/zephyr"
+  export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-playground/zephyr-sdk"
   ```
 
 ---
@@ -72,7 +72,7 @@ To initialize or reconstruct the shared `zephyrproject/` source tree and local `
 
 1. **Sync Python Virtual Environment**:
    ```bash
-   cd /home/markchang/zephyr
+   cd ~/zephyr-playground
    uv sync
    ```
 
@@ -83,47 +83,47 @@ To initialize or reconstruct the shared `zephyrproject/` source tree and local `
 
 3. **Fetch Modules & Binary Blobs**:
    ```bash
-   cd /home/markchang/zephyr/zephyrproject
+   cd ~/zephyr-playground/zephyrproject
    uv run west update
    uv run west zephyr-export
    uv run west blobs fetch hal_espressif
    ```
 
 4. **Install Local Zephyr SDK & Cross Compilers**:
-   Install the Zephyr SDK host tools (`dtc`, etc.) and desired compilers directly into `/home/markchang/zephyr/zephyr-sdk`:
+   Install the Zephyr SDK host tools (`dtc`, etc.) and desired compilers directly into `~/zephyr-playground/zephyr-sdk`:
    ```bash
-   cd /home/markchang/zephyr
-   uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
+   cd ~/zephyr-playground
+   uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
    ```
    *(This automatically extracts host tools, downloads the target toolchains, and registers the CMake package registry at `~/.cmake/packages/Zephyr-sdk`).*
 
-*(See [docs/startup.md](file:///home/markchang/zephyr/docs/startup.md) for the complete OS-level Arch Linux bring-up guide).*
+*(See [docs/startup.md](file:///home/markchang/zephyr-playground/docs/startup.md) for the complete OS-level Arch Linux bring-up guide).*
 
 ---
 
 ## Toolchain Management (`west sdk`)
 
-Zephyr builds require the Zephyr SDK host tools (`dtc`, OpenOCD) and architecture-specific GCC toolchains. In this repository, the SDK is kept self-contained under `/home/markchang/zephyr/zephyr-sdk` and tracked via the `ZEPHYR_SDK_INSTALL_DIR` environment variable.
+Zephyr builds require the Zephyr SDK host tools (`dtc`, OpenOCD) and architecture-specific GCC toolchains. In this repository, the SDK is kept self-contained under `~/zephyr-playground/zephyr-sdk` and tracked via the `ZEPHYR_SDK_INSTALL_DIR` environment variable.
 
 ### Check installed toolchains
 ```bash
 uv run west sdk list
 ```
-*(When `ZEPHYR_SDK_INSTALL_DIR` is set, `west sdk list` will display all toolchains installed in `/home/markchang/zephyr/zephyr-sdk`).*
+*(When `ZEPHYR_SDK_INSTALL_DIR` is set, `west sdk list` will display all toolchains installed in `~/zephyr-playground/zephyr-sdk`).*
 
 ### Install toolchains into local SDK
-Install only the toolchains needed for your target chips into `/home/markchang/zephyr/zephyr-sdk`:
+Install only the toolchains needed for your target chips into `~/zephyr-playground/zephyr-sdk`:
 
 | Target Chip Family | Architecture | Toolchain Name | Installation Command |
 |---|---|---|---|
-| **ESP32-S3** | Xtensa | `xtensa-espressif_esp32s3_zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf` |
-| **ESP32-C5 / C6 / C3** | RISC-V | `riscv64-zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t riscv64-zephyr-elf` |
-| **ESP32 (Original)** | Xtensa | `xtensa-espressif_esp32_zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32_zephyr-elf` |
-| **nRF52 / STM32 / RP2040** | ARM Cortex-M | `arm-zephyr-eabi` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t arm-zephyr-eabi` |
+| **ESP32-S3** | Xtensa | `xtensa-espressif_esp32s3_zephyr-elf` | `uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf` |
+| **ESP32-C5 / C6 / C3** | RISC-V | `riscv64-zephyr-elf` | `uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t riscv64-zephyr-elf` |
+| **ESP32 (Original)** | Xtensa | `xtensa-espressif_esp32_zephyr-elf` | `uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t xtensa-espressif_esp32_zephyr-elf` |
+| **nRF52 / STM32 / RP2040** | ARM Cortex-M | `arm-zephyr-eabi` | `uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t arm-zephyr-eabi` |
 
 Alternatively, you can run the bundled setup script inside `zephyr-sdk/` directly:
 ```bash
-cd /home/markchang/zephyr/zephyr-sdk
+cd ~/zephyr-playground/zephyr-sdk
 ./setup.sh -t <toolchain_name> -c
 ```
 
@@ -140,13 +140,13 @@ uv run west sdk list
 ```
 If missing, install it (example for ESP32-C6 / ESP32-C5):
 ```bash
-uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t riscv64-zephyr-elf
+uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t riscv64-zephyr-elf
 ```
 
 ### Step 2: Create the Project Directory Structure
-Navigate to `/home/markchang/zephyr` and create the new project folder:
+Navigate to `~/zephyr-playground` and create the new project folder:
 ```bash
-cd /home/markchang/zephyr
+cd ~/zephyr-playground
 mkdir -p <BOARD_DIR>/app/src
 ```
 
@@ -195,7 +195,7 @@ For example:
 Inside `<BOARD_DIR>`:
 - **First / Clean build (always use `-p always` or `-p auto`):**
   ```bash
-  cd /home/markchang/zephyr/<BOARD_DIR>
+  cd ~/zephyr-playground/<BOARD_DIR>
   uv run west build -p always -b <board_target> app
   ```
 - **Subsequent incremental builds:**
@@ -277,13 +277,13 @@ uv run ninja -C build help
 - **Fix**: Run:
   ```bash
   # Ensure ZEPHYR_SDK_INSTALL_DIR is exported
-  export ZEPHYR_SDK_INSTALL_DIR="/home/markchang/zephyr/zephyr-sdk"
+  export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr-playground/zephyr-sdk"
 
   # If not yet installed, install host tools & target compiler into workspace
-  uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t <toolchain_name>
+  uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t <toolchain_name>
 
   # Or re-register existing SDK with CMake package registry:
-  cd /home/markchang/zephyr/zephyr-sdk && ./setup.sh -c
+  cd ~/zephyr-playground/zephyr-sdk && ./setup.sh -c
   ```
 
 ### 2. `ninja: error: loading 'build.ninja': No such file or directory`

@@ -49,7 +49,7 @@ Navigate to your home directory (or chosen workspace parent) and clone or enter 
 cd ~
 # If cloning fresh:
 # git clone <your-repo-url> zephyr
-cd ~/zephyr
+cd ~/zephyr-playground
 ```
 
 Synchronize the Python virtual environment using `uv`. This reads `pyproject.toml` and `uv.lock` to install the exact pinned versions of `west`, `esptool`, and all Zephyr Python dependencies:
@@ -63,8 +63,8 @@ uv sync
 ## 3. Shell Environment Configuration (`ZEPHYR_BASE` & `ZEPHYR_SDK_INSTALL_DIR`)
 
 Zephyr tools require:
-- `ZEPHYR_BASE` pointing to the Zephyr kernel source directory (`~/zephyr/zephyrproject/zephyr`).
-- `ZEPHYR_SDK_INSTALL_DIR` pointing to the workspace-local Zephyr SDK (`~/zephyr/zephyr-sdk`).
+- `ZEPHYR_BASE` pointing to the Zephyr kernel source directory (`~/zephyr-playground/zephyrproject/zephyr`).
+- `ZEPHYR_SDK_INSTALL_DIR` pointing to the workspace-local Zephyr SDK (`~/zephyr-playground/zephyr-sdk`).
 
 ### Option A: Fish Shell (Recommended)
 
@@ -73,8 +73,8 @@ Create an autoloaded fish configuration file in `~/.config/fish/conf.d/zephyr.fi
 ```fish
 mkdir -p ~/.config/fish/conf.d
 cat << 'EOF' > ~/.config/fish/conf.d/zephyr.fish
-set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr
-set -gx ZEPHYR_SDK_INSTALL_DIR /home/markchang/zephyr/zephyr-sdk
+set -gx ZEPHYR_BASE ~/zephyr-playground/zephyrproject/zephyr
+set -gx ZEPHYR_SDK_INSTALL_DIR ~/zephyr-playground/zephyr-sdk
 EOF
 ```
 
@@ -108,11 +108,11 @@ source ~/.bashrc
 Pull the Zephyr OS repository, HALs, and external modules:
 
 ```bash
-cd ~/zephyr
+cd ~/zephyr-playground
 
 # Initialize west manifest pointing to zephyrproject
 # If zephyrproject folder already exists with a .west manifest:
-cd ~/zephyr/zephyrproject
+cd ~/zephyr-playground/zephyrproject
 uv run west update
 uv run west zephyr-export
 
@@ -122,7 +122,7 @@ uv run west blobs fetch hal_espressif
 
 > **If initializing completely from scratch without existing `zephyrproject`:**
 > ```bash
-> cd ~/zephyr
+> cd ~/zephyr-playground
 > uv run west init -m https://github.com/zephyrproject-rtos/zephyr --mr v4.5.0 zephyrproject
 > cd zephyrproject
 > uv run west update
@@ -134,7 +134,7 @@ uv run west blobs fetch hal_espressif
 
 ## 5. Install Zephyr SDK & Toolchains
 
-Zephyr uses `west sdk install` to fetch host tools (`dtc`, OpenOCD) and architecture-specific GCC compilers directly from official releases, registering the SDK with CMake package registries. In this workspace, the SDK is installed directly under `~/zephyr/zephyr-sdk`.
+Zephyr uses `west sdk install` to fetch host tools (`dtc`, OpenOCD) and architecture-specific GCC compilers directly from official releases, registering the SDK with CMake package registries. In this workspace, the SDK is installed directly under `~/zephyr-playground/zephyr-sdk`.
 
 ### Check currently installed SDKs & toolchains
 ```bash
@@ -146,26 +146,26 @@ To avoid downloading gigabytes of unused architectures, install only the toolcha
 
 - **For ESP32-S3 (Xtensa)**:
   ```bash
-  uv run west sdk install -d ~/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf
+  uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf
   ```
 - **For ESP32-C5 / ESP32-C6 / ESP32-C3 (RISC-V)**:
   ```bash
-  uv run west sdk install -d ~/zephyr/zephyr-sdk -t riscv64-zephyr-elf
+  uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t riscv64-zephyr-elf
   ```
 - **For ARM Cortex-M (nRF52, STM32, RP2040)**:
   ```bash
-  uv run west sdk install -d ~/zephyr/zephyr-sdk -t arm-zephyr-eabi
+  uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t arm-zephyr-eabi
   ```
 - **Multi-target install in one command (e.g., S3 and C5/C6)**:
   ```bash
-  uv run west sdk install -d ~/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
+  uv run west sdk install -d ~/zephyr-playground/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
   ```
 
 ### Install Hardware Debug / JTAG udev Rules (Optional but Recommended)
 Install OpenOCD udev rules so JTAG debuggers and hardware probes can be accessed without `sudo`:
 
 ```bash
-sudo cp ~/zephyr/zephyr-sdk/hosttools/sysroots/x86_64-pokysdk-linux/usr/share/openocd/contrib/60-openocd.rules /etc/udev/rules.d/
+sudo cp ~/zephyr-playground/zephyr-sdk/hosttools/sysroots/x86_64-pokysdk-linux/usr/share/openocd/contrib/60-openocd.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger
 ```
@@ -177,7 +177,7 @@ sudo udevadm trigger
 Test your setup by building the ESP32-S3-GEEK application:
 
 ```bash
-cd ~/zephyr/ESP32-S3-GEEK
+cd ~/zephyr-playground/ESP32-S3-GEEK
 
 # Always use -p always (pristine) on first build
 uv run west build -p always -b esp32s3_geek/esp32s3/procpu app
@@ -186,7 +186,7 @@ uv run west build -p always -b esp32s3_geek/esp32s3/procpu app
 Expected output:
 ```text
 -- west build: generating a build system
--- Found toolchain: zephyr 1.0.1 (/home/markchang/zephyr/zephyr-sdk)
+-- Found toolchain: zephyr 1.0.1 (~/zephyr-playground/zephyr-sdk)
 ...
 [262/262] Linking C executable zephyr/zephyr.elf
 Merged 10 ELF sections.
