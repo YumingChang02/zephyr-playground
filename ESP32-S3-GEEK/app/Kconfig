@@ -1,0 +1,39 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "Waveshare ESP32-S3-GEEK Application"
+
+menu "Application Wi-Fi Configuration"
+
+config APP_WIFI_SSID
+	string "Wi-Fi SSID"
+	help
+	  SSID of the Wi-Fi network to connect to.
+
+config APP_WIFI_PSK
+	string "Wi-Fi Password (PSK)"
+	help
+	  WPA2/WPA3 pre-shared key (password) of the Wi-Fi network.
+
+endmenu
+
+menu "Sensor and Sampling Configuration"
+
+config APP_SAMPLE_RATE_HZ
+	int "Sensor Sampling Rate (Hz)"
+	default 10
+	range 1 10
+	help
+	  Target sampling and update frequency for sensor acquisition,
+	  SD card logging, and SSE streaming (1 to 10 Hz).
+
+config APP_MOTOR_PULSES_PER_REV
+	int "Motor FG Pulses Per Revolution"
+	default 2
+	help
+	  Number of FG pulses generated per complete motor shaft revolution.
+
+endmenu
+
+source "Kconfig.zephyr"
+

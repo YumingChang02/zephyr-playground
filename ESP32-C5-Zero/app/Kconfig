@@ -1,0 +1,21 @@
+# Copyright (c) 2026
+# SPDX-License-Identifier: Apache-2.0
+
+mainmenu "Waveshare ESP32-C5-Zero Application"
+
+menu "Application Wi-Fi Configuration"
+
+config APP_WIFI_SSID
+	string "Wi-Fi SSID"
+	help
+	  SSID of the Wi-Fi network to connect to.
+
+config APP_WIFI_PSK
+	string "Wi-Fi Password (PSK)"
+	help
+	  WPA2/WPA3 pre-shared key (password) of the Wi-Fi network.
+
+endmenu
+
+source "Kconfig.zephyr"
+

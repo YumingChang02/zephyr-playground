@@ -60,9 +60,11 @@ uv sync
 
 ---
 
-## 3. Shell Environment Configuration (`ZEPHYR_BASE`)
+## 3. Shell Environment Configuration (`ZEPHYR_BASE` & `ZEPHYR_SDK_INSTALL_DIR`)
 
-Zephyr tools require the `ZEPHYR_BASE` environment variable to point to the Zephyr kernel source directory (`~/zephyr/zephyrproject/zephyr`).
+Zephyr tools require:
+- `ZEPHYR_BASE` pointing to the Zephyr kernel source directory (`~/zephyr/zephyrproject/zephyr`).
+- `ZEPHYR_SDK_INSTALL_DIR` pointing to the workspace-local Zephyr SDK (`~/zephyr/zephyr-sdk`).
 
 ### Option A: Fish Shell (Recommended)
 
@@ -72,6 +74,7 @@ Create an autoloaded fish configuration file in `~/.config/fish/conf.d/zephyr.fi
 mkdir -p ~/.config/fish/conf.d
 cat << 'EOF' > ~/.config/fish/conf.d/zephyr.fish
 set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr
+set -gx ZEPHYR_SDK_INSTALL_DIR /home/markchang/zephyr/zephyr-sdk
 EOF
 ```
 
@@ -82,13 +85,14 @@ source ~/.config/fish/conf.d/zephyr.fish
 
 ### Option B: Bash Shell
 
-Append `ZEPHYR_BASE` to your `~/.bashrc`:
+Append the variables to your `~/.bashrc`:
 
 ```bash
 cat << 'EOF' >> ~/.bashrc
 
 # Zephyr RTOS Environment
 export ZEPHYR_BASE="$HOME/zephyr/zephyrproject/zephyr"
+export ZEPHYR_SDK_INSTALL_DIR="$HOME/zephyr/zephyr-sdk"
 EOF
 ```
 
@@ -130,7 +134,7 @@ uv run west blobs fetch hal_espressif
 
 ## 5. Install Zephyr SDK & Toolchains
 
-Zephyr uses `west sdk install` to fetch host tools (`dtc`, OpenOCD) and architecture-specific GCC compilers directly from official releases, registering the SDK with CMake package registries.
+Zephyr uses `west sdk install` to fetch host tools (`dtc`, OpenOCD) and architecture-specific GCC compilers directly from official releases, registering the SDK with CMake package registries. In this workspace, the SDK is installed directly under `~/zephyr/zephyr-sdk`.
 
 ### Check currently installed SDKs & toolchains
 ```bash
@@ -138,31 +142,30 @@ uv run west sdk list
 ```
 
 ### Install Toolchains for Target Chips
-
-To avoid downloading gigabytes of unused architectures, install only the toolchains you intend to target:
+To avoid downloading gigabytes of unused architectures, install only the toolchains you intend to target into the workspace-local `zephyr-sdk`:
 
 - **For ESP32-S3 (Xtensa)**:
   ```bash
-  uv run west sdk install -t xtensa-espressif_esp32s3_zephyr-elf
+  uv run west sdk install -d ~/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf
   ```
-- **For ESP32-C6 / ESP32-C3 (RISC-V)**:
+- **For ESP32-C5 / ESP32-C6 / ESP32-C3 (RISC-V)**:
   ```bash
-  uv run west sdk install -t riscv64-zephyr-elf
+  uv run west sdk install -d ~/zephyr/zephyr-sdk -t riscv64-zephyr-elf
   ```
 - **For ARM Cortex-M (nRF52, STM32, RP2040)**:
   ```bash
-  uv run west sdk install -t arm-zephyr-eabi
+  uv run west sdk install -d ~/zephyr/zephyr-sdk -t arm-zephyr-eabi
   ```
-- **Multi-target install in one command (e.g., S3 and C6)**:
+- **Multi-target install in one command (e.g., S3 and C5/C6)**:
   ```bash
-  uv run west sdk install -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
+  uv run west sdk install -d ~/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
   ```
 
 ### Install Hardware Debug / JTAG udev Rules (Optional but Recommended)
 Install OpenOCD udev rules so JTAG debuggers and hardware probes can be accessed without `sudo`:
 
 ```bash
-sudo cp ~/zephyr-sdk-*/hosttools/sysroots/x86_64-pokysdk-linux/usr/share/openocd/contrib/60-openocd.rules /etc/udev/rules.d/
+sudo cp ~/zephyr/zephyr-sdk/hosttools/sysroots/x86_64-pokysdk-linux/usr/share/openocd/contrib/60-openocd.rules /etc/udev/rules.d/
 sudo udevadm control --reload
 sudo udevadm trigger
 ```
@@ -183,7 +186,7 @@ uv run west build -p always -b esp32s3_geek/esp32s3/procpu app
 Expected output:
 ```text
 -- west build: generating a build system
--- Found toolchain: zephyr 1.0.1 (/home/markchang/zephyr-sdk-1.0.1)
+-- Found toolchain: zephyr 1.0.1 (/home/markchang/zephyr/zephyr-sdk)
 ...
 [262/262] Linking C executable zephyr/zephyr.elf
 Merged 10 ELF sections.

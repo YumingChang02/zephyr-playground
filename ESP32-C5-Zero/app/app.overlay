@@ -1,0 +1,32 @@
+/ {
+	chosen {
+		/* Direct console output to onboard USB-C (USB Serial/JTAG) */
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+
+	aliases {
+		/* Portable application alias pointing to this board's hardware counter */
+		app-timer = &counter0;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
+
+&timer0 {
+	status = "okay";
+	prescaler = <10>;
+
+	counter0: counter {
+		status = "okay";
+	};
+};
+
+/* Waveshare ESP32-C5-Zero has 4MB SPI Flash (overriding default 8MB devkit) */
+&flash0 {
+	reg = <0x0 DT_SIZE_M(4)>;
+	ranges = <0x0 0x0 DT_SIZE_M(4)>;
+};
+

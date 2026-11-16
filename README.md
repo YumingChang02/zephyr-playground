@@ -19,11 +19,26 @@ This repository is a unified Zephyr workspace and Python environment located at 
 │   ├── .west/
 │   ├── modules/
 │   └── zephyr/
+├── zephyr-sdk/                     <-- Project-local Zephyr SDK & toolchains
+│   ├── cmake/
+│   ├── gnu/
+│   ├── hosttools/
+│   └── setup.sh
 │
-├── ESP32-S3-GEEK/                  <-- Waveshare ESP32-S3-GEEK project
+├── ESP32-S3-GEEK/                  <-- Waveshare ESP32-S3-GEEK project (Xtensa)
 │   ├── app/
 │   │   ├── CMakeLists.txt
 │   │   ├── prj.conf
+│   │   ├── app.overlay
+│   │   └── src/
+│   │       └── main.c
+│   └── build/                      <-- Build output artifacts
+│
+├── ESP32-C5-Zero/                  <-- Waveshare ESP32-C5-Zero project (RISC-V)
+│   ├── app/
+│   │   ├── CMakeLists.txt
+│   │   ├── prj.conf
+│   │   ├── app.overlay
 │   │   └── src/
 │   │       └── main.c
 │   └── build/                      <-- Build output artifacts
@@ -37,21 +52,23 @@ This repository is a unified Zephyr workspace and Python environment located at 
 
 - **Always run commands via `uv run`**:
   Do not manually add `.venv/bin` to `PATH`. When you run `uv run west <command>` inside any project subfolder, `uv` automatically walks up the directory tree to find and use `/home/markchang/zephyr/.venv`.
-- **`ZEPHYR_BASE` Environment Variable**:
+- **Environment Variables (`ZEPHYR_BASE` & `ZEPHYR_SDK_INSTALL_DIR`)**:
   Configured in `~/.config/fish/conf.d/zephyr.fish`:
   ```fish
   set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr
+  set -gx ZEPHYR_SDK_INSTALL_DIR /home/markchang/zephyr/zephyr-sdk
   ```
-  In bash / sh:
+  In bash / sh (`~/.bashrc`):
   ```bash
-  export ZEPHYR_BASE=/home/markchang/zephyr/zephyrproject/zephyr
+  export ZEPHYR_BASE="/home/markchang/zephyr/zephyrproject/zephyr"
+  export ZEPHYR_SDK_INSTALL_DIR="/home/markchang/zephyr/zephyr-sdk"
   ```
 
 ---
 
-## Workspace Initialization (`west init` & `west update`)
+## Workspace Initialization (`west init`, `west update`, & SDK setup)
 
-To initialize or reconstruct the shared `zephyrproject/` source tree from scratch:
+To initialize or reconstruct the shared `zephyrproject/` source tree and local `zephyr-sdk` from scratch:
 
 1. **Sync Python Virtual Environment**:
    ```bash
@@ -66,11 +83,19 @@ To initialize or reconstruct the shared `zephyrproject/` source tree from scratc
 
 3. **Fetch Modules & Binary Blobs**:
    ```bash
-   cd zephyrproject
+   cd /home/markchang/zephyr/zephyrproject
    uv run west update
    uv run west zephyr-export
    uv run west blobs fetch hal_espressif
    ```
+
+4. **Install Local Zephyr SDK & Cross Compilers**:
+   Install the Zephyr SDK host tools (`dtc`, etc.) and desired compilers directly into `/home/markchang/zephyr/zephyr-sdk`:
+   ```bash
+   cd /home/markchang/zephyr
+   uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf riscv64-zephyr-elf
+   ```
+   *(This automatically extracts host tools, downloads the target toolchains, and registers the CMake package registry at `~/.cmake/packages/Zephyr-sdk`).*
 
 *(See [docs/startup.md](file:///home/markchang/zephyr/docs/startup.md) for the complete OS-level Arch Linux bring-up guide).*
 
@@ -78,24 +103,29 @@ To initialize or reconstruct the shared `zephyrproject/` source tree from scratc
 
 ## Toolchain Management (`west sdk`)
 
-Zephyr builds require the Zephyr SDK host tools (`dtc`, etc.) and the cross-compiler toolchain matching your board's MCU architecture.
+Zephyr builds require the Zephyr SDK host tools (`dtc`, OpenOCD) and architecture-specific GCC toolchains. In this repository, the SDK is kept self-contained under `/home/markchang/zephyr/zephyr-sdk` and tracked via the `ZEPHYR_SDK_INSTALL_DIR` environment variable.
 
 ### Check installed toolchains
 ```bash
 uv run west sdk list
 ```
+*(When `ZEPHYR_SDK_INSTALL_DIR` is set, `west sdk list` will display all toolchains installed in `/home/markchang/zephyr/zephyr-sdk`).*
 
-### Install toolchains for your targets
-Instead of downloading the entire multi-gigabyte bundle, install only the toolchains needed:
+### Install toolchains into local SDK
+Install only the toolchains needed for your target chips into `/home/markchang/zephyr/zephyr-sdk`:
 
 | Target Chip Family | Architecture | Toolchain Name | Installation Command |
 |---|---|---|---|
-| **ESP32-S3** | Xtensa | `xtensa-espressif_esp32s3_zephyr-elf` | `uv run west sdk install -t xtensa-espressif_esp32s3_zephyr-elf` |
-| **ESP32-C6 / ESP32-C3** | RISC-V | `riscv64-zephyr-elf` | `uv run west sdk install -t riscv64-zephyr-elf` |
-| **ESP32 (Original)** | Xtensa | `xtensa-espressif_esp32_zephyr-elf` | `uv run west sdk install -t xtensa-espressif_esp32_zephyr-elf` |
-| **nRF52 / STM32 / RP2040** | ARM Cortex-M | `arm-zephyr-eabi` | `uv run west sdk install -t arm-zephyr-eabi` |
+| **ESP32-S3** | Xtensa | `xtensa-espressif_esp32s3_zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32s3_zephyr-elf` |
+| **ESP32-C5 / C6 / C3** | RISC-V | `riscv64-zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t riscv64-zephyr-elf` |
+| **ESP32 (Original)** | Xtensa | `xtensa-espressif_esp32_zephyr-elf` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t xtensa-espressif_esp32_zephyr-elf` |
+| **nRF52 / STM32 / RP2040** | ARM Cortex-M | `arm-zephyr-eabi` | `uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t arm-zephyr-eabi` |
 
-*(To install all available toolchains: `uv run west sdk install`)*
+Alternatively, you can run the bundled setup script inside `zephyr-sdk/` directly:
+```bash
+cd /home/markchang/zephyr/zephyr-sdk
+./setup.sh -t <toolchain_name> -c
+```
 
 ---
 
@@ -108,9 +138,9 @@ Check if the toolchain for your board is installed:
 ```bash
 uv run west sdk list
 ```
-If missing, install it (example for ESP32-C6):
+If missing, install it (example for ESP32-C6 / ESP32-C5):
 ```bash
-uv run west sdk install -t riscv64-zephyr-elf
+uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t riscv64-zephyr-elf
 ```
 
 ### Step 2: Create the Project Directory Structure
@@ -172,6 +202,10 @@ Inside `<BOARD_DIR>`:
   ```bash
   uv run west build app
   ```
+- **Fast incremental builds (source code changes only):**
+  ```bash
+  uv run ninja -C build
+  ```
 
 ### Step 6: Flash & Serial Monitor
 1. **Flash firmware:**
@@ -186,15 +220,71 @@ Inside `<BOARD_DIR>`:
 
 ---
 
+## Ninja: Fast Incremental Builds & Inspection
+
+### What is Ninja?
+**Ninja** is a lightweight, ultra-fast build tool designed specifically to execute build commands generated by CMake. 
+In Zephyr, `west build` is a high-level Python wrapper that invokes CMake to configure the project, which in turn generates `build/build.ninja`. When `west build` compiles your code, it actually runs `ninja` behind the scenes.
+
+Because `ninja` is installed inside the shared Python virtual environment (`.venv`), you invoke it using:
+```bash
+uv run ninja -C <BOARD_DIR>/build
+```
+
+---
+
+### When to Use Ninja vs. `west build`
+
+| Scenario | Recommended Command | Why |
+| :--- | :--- | :--- |
+| **Editing C/C++ code (`.c`, `.h`)** | `uv run ninja -C build` | **Sub-second rebuilds**: Skips `west` Python overhead and Zephyr module dependency checking; immediately invokes the compiler on only the modified files. |
+| **First build of a project** | `uv run west build -p always -b <target> app` | Configures the board, parses Kconfig, and runs CMake to generate the initial `build.ninja`. |
+| **Modifying `prj.conf` (Kconfig)** | `uv run west build app` | Requires Kconfig parser to re-evaluate symbols and update `autoconf.h`. |
+| **Modifying `*.overlay` (Devicetree)** | `uv run west build app` | Requires `dtc` and Zephyr devicetree scripts to regenerate `devicetree_generated.h`. |
+| **Modifying `CMakeLists.txt`** | `uv run west build app` | Requires CMake configuration step to re-run. |
+| **Compiler diagnostic / flags debug** | `uv run ninja -C build -v` | Shows the exact compiler invocation, flags (`-I`, `-D`, `-O`), and linker commands. |
+
+---
+
+### Useful Ninja Commands
+
+All commands can be run from the board directory or workspace root:
+
+```bash
+# 1. Fast incremental build (from board directory)
+uv run ninja -C build
+
+# 2. Verbose build (inspect exact gcc flags, includes, and defines)
+uv run ninja -C build -v
+
+# 3. Memory & footprint reports
+uv run ninja -C build rom_report    # Detailed breakdown of Flash/ROM usage per symbol
+uv run ninja -C build ram_report    # Detailed breakdown of SRAM/RAM usage per symbol
+
+# 4. Clean compiled objects (keeps CMake cache and configuration intact)
+uv run ninja -C build clean
+
+# 5. List available build targets
+uv run ninja -C build help
+```
+
+---
+
 ## Troubleshooting Common Errors
 
 ### 1. `Could not find a package configuration file provided by "Zephyr-sdk"`
-- **Cause**: Zephyr SDK is not installed or not registered in CMake package registry (`~/.cmake/packages/Zephyr-sdk`).
+- **Cause**: Zephyr SDK is not installed or not registered in CMake package registry (`~/.cmake/packages/Zephyr-sdk`), or `ZEPHYR_SDK_INSTALL_DIR` is not set.
 - **Fix**: Run:
   ```bash
-  uv run west sdk install -t <toolchain_name>
+  # Ensure ZEPHYR_SDK_INSTALL_DIR is exported
+  export ZEPHYR_SDK_INSTALL_DIR="/home/markchang/zephyr/zephyr-sdk"
+
+  # If not yet installed, install host tools & target compiler into workspace
+  uv run west sdk install -d /home/markchang/zephyr/zephyr-sdk -t <toolchain_name>
+
+  # Or re-register existing SDK with CMake package registry:
+  cd /home/markchang/zephyr/zephyr-sdk && ./setup.sh -c
   ```
-  This downloads host tools (`dtc`), downloads the compiler, and registers the SDK with CMake.
 
 ### 2. `ninja: error: loading 'build.ninja': No such file or directory`
 - **Cause**: A previous CMake configuration failed, leaving an incomplete `build/` directory. Running `west build` again assumes an incremental build and immediately calls `ninja`, which cannot find the missing `build.ninja`.

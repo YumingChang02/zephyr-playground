@@ -2,8 +2,10 @@
 # Zephyr Multi-Board Workspace .gitignore
 # ==========================================
 
-# Shared Zephyr Tree (Managed independently by west / git)
+# Shared Zephyr Tree & SDK (Managed independently by west / git)
 zephyrproject/
+zephyr-sdk*/
+
 
 # Python Virtual Environment & Artifacts
 .venv/
@@ -26,6 +28,12 @@ __pycache__/
 compile_commands.json
 .ninja_*
 *.ninja
+
+# Local secrets and credential configuration files
+credentials.conf
+*.secret.conf
+local.conf
+prj_local.conf
 
 # Cache directories
 .cache/

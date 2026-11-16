@@ -18,7 +18,7 @@
 - **Workspace Layout**:
   - Shared Zephyr tree: `/home/markchang/zephyr/zephyrproject`
   - Shared Python virtualenv & tools: `/home/markchang/zephyr/.venv`
-  - Board / App directories: `/home/markchang/zephyr/ESP32-S3-GEEK`, `/home/markchang/zephyr/ESP32-C6-LCD-1.47`, etc.
+  - Board / App directories: `/home/markchang/zephyr/ESP32-S3-GEEK`, `/home/markchang/zephyr/ESP32-C5-Zero`, etc.
 - **Environment**:
   - `ZEPHYR_BASE` is set in `~/.config/fish/conf.d/zephyr.fish` (`set -gx ZEPHYR_BASE /home/markchang/zephyr/zephyrproject/zephyr`).
 - **Toolchains (`west sdk`)**:

@@ -1,0 +1,74 @@
+#include <zephyr/dt-bindings/pwm/pwm.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+
+/ {
+	aliases {
+		/* Portable application alias pointing to this board's hardware counter */
+		app-timer = &counter0;
+		motor-pwm = &pwm_motor;
+		fg-pin = &fg_sensor;
+	};
+
+	motor_pwm {
+		compatible = "pwm-leds";
+		pwm_motor: pwm_motor_0 {
+			pwms = <&ledc0 0 PWM_USEC(40) PWM_POLARITY_NORMAL>; /* 25 kHz */
+			label = "Motor PWM Output";
+		};
+	};
+
+	sensor_pins {
+		compatible = "gpio-keys";
+		fg_sensor: fg_sensor_0 {
+			gpios = <&gpio0 6 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+			label = "Motor FG Pulse Input";
+		};
+	};
+};
+
+&timer0 {
+	status = "okay";
+	prescaler = <10>;
+
+	counter0: counter {
+		status = "okay";
+	};
+};
+
+&pinctrl {
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO7>;
+			output-enable;
+		};
+	};
+};
+
+&ledc0 {
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	channel0@0 {
+		reg = <0x0>;
+		timer = <0>;
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	ina219: ina219@40 {
+		compatible = "ti,ina219";
+		reg = <0x40>;
+		brng = <1>;
+		pg = <3>;
+		sadc = <3>;
+		badc = <3>;
+		shunt-milliohm = <100>;
+		lsb-microamp = <100>;
+		status = "okay";
+	};
+};
