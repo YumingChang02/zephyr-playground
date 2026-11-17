@@ -43,7 +43,15 @@ This repository is a unified Zephyr workspace and Python environment located at 
 │   │       └── main.c
 │   └── build/                      <-- Build output artifacts
 │
-└── ESP32-C6-LCD-1.47/              <-- Future board project
+└── ESP32-C6-LCD-147/               <-- Waveshare ESP32-C6-LCD-1.47 project (RISC-V)
+    ├── app/
+    │   ├── CMakeLists.txt
+    │   ├── prj.conf
+    │   ├── app.overlay
+    │   └── src/
+    │       ├── main.c
+    │       └── telemetry.h
+    └── build/                      <-- Build output artifacts
 ```
 
 ---

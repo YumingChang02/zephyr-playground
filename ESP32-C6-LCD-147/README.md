@@ -73,22 +73,47 @@ Unlike the dual-core AMP sysbuild on ESP32-S3, the **ESP32-C6 architecture is a 
 
 ---
 
-## 3. Building & Flashing
+## 3. Wi-Fi Configuration
+
+Wi-Fi credentials are kept private and out of version control using `app/credentials.conf`:
+
+1. Copy the template:
+   ```bash
+   cp app/credentials.conf.template app/credentials.conf
+   ```
+2. Edit `app/credentials.conf` with your network credentials:
+   ```ini
+   CONFIG_APP_WIFI_SSID="YourNetworkSSID"
+   CONFIG_APP_WIFI_PSK="YourNetworkPassword"
+   ```
+`credentials.conf` is ignored by Git and automatically merged into the build by `app/CMakeLists.txt`.
+
+---
+
+## 4. Building & Flashing
 
 From the `ESP32-C6-LCD-147` directory:
 
-### Build Firmware:
+### 1. Build Firmware
 ```bash
-cd /home/markchang/zephyr-playground/ESP32-C6-LCD-147
-ZEPHYR_SDK_INSTALL_DIR=/home/markchang/zephyr-playground/zephyr-sdk \
-ZEPHYR_TOOLCHAIN_VARIANT=zephyr \
-WEST_WORKSPACE=/home/markchang/zephyr-playground/zephyrproject \
-ZEPHYR_BASE=/home/markchang/zephyr-playground/zephyrproject/zephyr \
-uv run west build -b esp32c6_lcd_1_47/esp32c6/hpcore
+cd ~/zephyr-playground/ESP32-C6-LCD-147
+
+# Pristine build:
+uv run west build -p always -b esp32c6_lcd_1_47/esp32c6/hpcore app
+
+# Incremental build:
+uv run west build app
 ```
 
-### Flash Firmware:
+*(Note: Ensure `ZEPHYR_BASE` and `ZEPHYR_SDK_INSTALL_DIR` are set in your environment as described in the workspace root README, e.g. via `zephyr.fish` or `~/.bashrc`).*
+
+### 2. Flash Firmware
 ```bash
-cd /home/markchang/zephyr-playground/ESP32-C6-LCD-147
 uv run west flash
 ```
+
+### 3. Monitor Serial Console
+```bash
+uv run west espressif monitor
+```
+*(Press `Ctrl + ]` to exit the monitor)*
