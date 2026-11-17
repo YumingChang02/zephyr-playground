@@ -1146,6 +1146,8 @@ static int get_query_param_int(const char *req, const char *param, int default_v
 static struct net_mgmt_event_callback wifi_mgmt_cb;
 static struct net_mgmt_event_callback ipv4_mgmt_cb;
 static uint32_t wifi_attempt_count = 0;
+static volatile bool wifi_connecting = false;
+static int64_t last_connect_start_ms = 0;
 
 static void trigger_wifi_connect(void)
 {
@@ -1155,7 +1157,21 @@ static void trigger_wifi_connect(void)
 		return;
 	}
 
+	if (wifi_connected) {
+		return;
+	}
+
+	/* If a previous connection was in progress, issue DISCONNECT to cleanly reset driver state */
+	if (wifi_connecting) {
+		printk("[Wi-Fi] Resetting Wi-Fi driver state before initiating fresh connect...\n");
+		net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+		k_msleep(250);
+		wifi_connecting = false;
+	}
+
 	wifi_attempt_count++;
+	last_connect_start_ms = k_uptime_get();
+	wifi_connecting = true;
 
 	char mac_str[18] = "Unknown MAC";
 	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
@@ -1168,12 +1184,31 @@ static void trigger_wifi_connect(void)
 #if defined(CONFIG_APP_WIFI_SSID)
 	if (strlen(CONFIG_APP_WIFI_SSID) == 0) {
 		printk("[Wi-Fi] WARNING: CONFIG_APP_WIFI_SSID is empty! Please configure credentials.conf\n");
+		wifi_connecting = false;
 		return;
 	}
 	const char *ssid = CONFIG_APP_WIFI_SSID;
 	const char *psk = CONFIG_APP_WIFI_PSK;
 	size_t psk_len = strlen(psk);
-	const char *sec_str = (psk_len > 0) ? "WPA2/WPA3-PSK" : "Open";
+
+	enum wifi_security_type sec_type = WIFI_SECURITY_TYPE_NONE;
+	const char *sec_str = "Open";
+
+	if (psk_len > 0) {
+#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
+		/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
+		if ((wifi_attempt_count % 2) == 0) {
+			sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
+			sec_str = "WPA3-SAE (Auto)";
+		} else {
+			sec_type = WIFI_SECURITY_TYPE_PSK;
+			sec_str = "WPA2-PSK";
+		}
+#else
+		sec_type = WIFI_SECURITY_TYPE_PSK;
+		sec_str = "WPA2-PSK";
+#endif
+	}
 
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
 	printk("[Wi-Fi] Connection Attempt #%u\n", wifi_attempt_count);
@@ -1189,13 +1224,14 @@ static void trigger_wifi_connect(void)
 		.psk = (const uint8_t *)psk,
 		.psk_length = psk_len,
 		.channel = WIFI_CHANNEL_ANY,
-		.security = (psk_len > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
+		.security = sec_type,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
 		.mfp = WIFI_MFP_OPTIONAL,
 	};
 
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
 	if (ret != 0) {
+		wifi_connecting = false;
 		printk("[Wi-Fi] ERROR: Connect request rejected immediately by stack (err: %d - %s)\n",
 		       ret, ret == -EALREADY ? "Connection in progress" :
 		            ret == -EBUSY ? "Device busy" :
@@ -1206,6 +1242,7 @@ static void trigger_wifi_connect(void)
 	}
 #else
 	printk("[Wi-Fi] WARNING: No SSID configured! Please configure credentials.conf\n");
+	wifi_connecting = false;
 #endif
 }
 
@@ -1214,6 +1251,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 {
 	switch (mgmt_event) {
 	case NET_EVENT_WIFI_CONNECT_RESULT: {
+		wifi_connecting = false;
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
 		if (!status) {
 			printk("[Wi-Fi] Event: CONNECT_RESULT (no status data)\n");
@@ -1253,6 +1291,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 	}
 	case NET_EVENT_WIFI_DISCONNECT_RESULT: {
 		wifi_connected = false;
+		wifi_connecting = false;
 		wifi_has_ip = false;
 		wifi_ip_addr[0] = '\0';
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
@@ -1345,15 +1384,24 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	/* Trigger initial connection attempt */
 	trigger_wifi_connect();
-	last_reconnect_attempt = k_uptime_get();
 
 	while (1) {
 		int64_t now = k_uptime_get();
 
-		/* Auto-reconnect supervisor: retry every 10 seconds if disconnected */
-		if (!wifi_connected && (now - last_reconnect_attempt > 10000)) {
-			last_reconnect_attempt = now;
-			trigger_wifi_connect();
+		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
+		if (!wifi_connected) {
+			if (wifi_connecting) {
+				/* Watchdog: If in-flight connection has been waiting > 20s without driver callback, reset and retry */
+				if (now - last_connect_start_ms > 20000) {
+					printk("[Wi-Fi] Connection attempt timed out (20s). Retrying with clean state...\n");
+					trigger_wifi_connect();
+				}
+			} else {
+				/* If disconnected and not connecting, wait 10s between attempts */
+				if (now - last_connect_start_ms > 10000) {
+					trigger_wifi_connect();
+				}
+			}
 		}
 
 		/* If associated but waiting for DHCP IPv4 address */
