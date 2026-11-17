@@ -15,6 +15,14 @@ config APP_WIFI_PSK
 	help
 	  WPA2/WPA3 pre-shared key (password) of the Wi-Fi network.
 
+config APP_WIFI_CHANNEL
+	int "Target Wi-Fi Channel (0 for Auto/Scan)"
+	default 0
+	range 0 14
+	help
+	  Target 2.4 GHz Wi-Fi channel (1-14) to connect immediately without
+	  scanning all channels. Set to 0 to scan all channels.
+
 config APP_STATIC_IP
 	string "Static IPv4 Address (Optional)"
 	default ""

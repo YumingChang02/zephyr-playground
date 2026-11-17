@@ -151,8 +151,6 @@ static volatile bool wifi_connected = false;
 static volatile bool wifi_connecting = false;
 static volatile bool wifi_has_ip = false;
 static char assigned_ipv4_str[NET_IPV4_ADDR_LEN] = "0.0.0.0";
-static volatile int64_t last_dhcp_log = 0;
-static int64_t last_connect_start_ms = 0;
 static uint32_t wifi_attempt_count = 0;
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
@@ -997,6 +995,71 @@ static void csv_download_thread_fn(void *p1, void *p2, void *p3)
 /* ========================================================================= */
 /* Thread 2 (Wi-Fi, Auto-Reconnect & HTTP/SSE Web Server)                    */
 /* ========================================================================= */
+static bool apply_static_ip_if_configured(struct net_if *iface)
+{
+#if defined(CONFIG_APP_STATIC_IP)
+	if (sizeof(CONFIG_APP_STATIC_IP) > 1 && CONFIG_APP_STATIC_IP[0] != '\0') {
+		struct in_addr ip_addr;
+		struct in_addr netmask;
+		struct in_addr gw;
+
+		if (net_addr_pton(AF_INET, CONFIG_APP_STATIC_IP, &ip_addr) < 0) {
+			printk("[Wi-Fi] ERROR: Invalid static IP address format: '%s'\n", CONFIG_APP_STATIC_IP);
+			return false;
+		}
+
+		/* Subnet mask (default 255.255.255.0 if not specified or invalid) */
+		const char *nm_str = "255.255.255.0";
+#if defined(CONFIG_APP_STATIC_NETMASK)
+		if (sizeof(CONFIG_APP_STATIC_NETMASK) > 1 && CONFIG_APP_STATIC_NETMASK[0] != '\0') {
+			nm_str = CONFIG_APP_STATIC_NETMASK;
+		}
+#endif
+		if (net_addr_pton(AF_INET, nm_str, &netmask) < 0) {
+			net_addr_pton(AF_INET, "255.255.255.0", &netmask);
+		}
+
+		/* Gateway */
+#if defined(CONFIG_APP_STATIC_GW)
+		if (sizeof(CONFIG_APP_STATIC_GW) > 1 && CONFIG_APP_STATIC_GW[0] != '\0') {
+			if (net_addr_pton(AF_INET, CONFIG_APP_STATIC_GW, &gw) == 0) {
+				net_if_ipv4_set_gw(iface, &gw);
+			}
+		}
+#endif
+
+		/* Add unicast static IP */
+		struct net_if_addr *if_addr = net_if_ipv4_addr_add(iface, &ip_addr, NET_ADDR_MANUAL, 0);
+		if (!if_addr) {
+			printk("[Wi-Fi] ERROR: Failed to assign static IP '%s' to network interface!\n",
+			       CONFIG_APP_STATIC_IP);
+			return false;
+		}
+
+		/* Set netmask for this address */
+		net_if_ipv4_set_netmask_by_addr(iface, &ip_addr, &netmask);
+
+		/* Reconfigure DNS resolver if gateway or public DNS available */
+#if defined(CONFIG_DNS_RESOLVER)
+		const char *dns_servers[3] = { NULL, NULL, NULL };
+		int dns_idx = 0;
+#if defined(CONFIG_APP_STATIC_GW)
+		if (sizeof(CONFIG_APP_STATIC_GW) > 1 && CONFIG_APP_STATIC_GW[0] != '\0') {
+			dns_servers[dns_idx++] = CONFIG_APP_STATIC_GW;
+		}
+#endif
+		dns_servers[dns_idx++] = "8.8.8.8";
+		dns_servers[dns_idx] = NULL;
+		dns_resolve_reconfigure(dns_resolve_get_default(), dns_servers, NULL, DNS_SOURCE_MANUAL);
+#endif
+
+		printk("[Wi-Fi] Assigned static IPv4: %s (Netmask: %s)\n", CONFIG_APP_STATIC_IP, nm_str);
+		return true;
+	}
+#endif
+	return false;
+}
+
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
                                     uint64_t mgmt_event, struct net_if *iface)
 {
@@ -1010,29 +1073,20 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		if (status->status == 0) {
 			wifi_connected = true;
-			last_dhcp_log = k_uptime_get();
 			printk("\n============================================================\n");
-			printk("[Wi-Fi] Association SUCCESSFUL!\n");
-			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
-			printk("[Wi-Fi]   Status      : %s (code %d)\n",
-			       wifi_conn_status_txt(status->conn_status), status->status);
-			printk("[Wi-Fi]   Link State  : UP -> Requesting DHCP IPv4 address...\n");
+			printk("[Wi-Fi] Connected successfully to '%s'\n", CONFIG_APP_WIFI_SSID);
 			printk("============================================================\n");
-			net_dhcpv4_start(iface);
+
+			if (apply_static_ip_if_configured(iface)) {
+				printk("[Wi-Fi] Static IPv4 configured: %s\n", CONFIG_APP_STATIC_IP);
+			}
 		} else {
 			wifi_connected = false;
 			wifi_has_ip = false;
 			assigned_ipv4_str[0] = '\0';
+			int code = status ? status->status : -1;
 			printk("\n============================================================\n");
-			printk("[Wi-Fi] Association FAILED!\n");
-			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
-			printk("[Wi-Fi]   Status      : %s (code %d)\n",
-			       wifi_conn_status_txt(status->conn_status), status->status);
-			if (status->status_code != 0 || status->reason_code != 0) {
-				printk("[Wi-Fi]   802.11 Code : Status=%u, Reason=%u\n",
-				       status->status_code, status->reason_code);
-			}
-			printk("[Wi-Fi]   Action      : Auto-reconnect will retry in 10s...\n");
+			printk("[Wi-Fi] Connection failed with status: %d, will retry...\n", code);
 			printk("============================================================\n");
 		}
 		break;
@@ -1042,19 +1096,17 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		wifi_connecting = false;
 		wifi_has_ip = false;
 		assigned_ipv4_str[0] = '\0';
-		net_dhcpv4_stop(iface);
-		const struct wifi_status *status = (const struct wifi_status *)cb->info;
 		printk("\n============================================================\n");
-		printk("[Wi-Fi] Disconnected from AP!\n");
-		if (status) {
-			printk("[Wi-Fi]   Reason      : %s (code %d)\n",
-			       wifi_disconn_reason_txt(status->disconn_reason), status->status);
-			if (status->reason_code != 0) {
-				printk("[Wi-Fi]   802.11 Reason: %u\n", status->reason_code);
+		printk("[Wi-Fi] Disconnected from network! Auto-reconnect active...\n");
+		printk("============================================================\n");
+#if defined(CONFIG_APP_STATIC_IP)
+		if (sizeof(CONFIG_APP_STATIC_IP) > 1 && CONFIG_APP_STATIC_IP[0] != '\0') {
+			struct in_addr ip_addr;
+			if (net_addr_pton(AF_INET, CONFIG_APP_STATIC_IP, &ip_addr) == 0) {
+				net_if_ipv4_addr_rm(iface, &ip_addr);
 			}
 		}
-		printk("[Wi-Fi]   State       : Network down, auto-reconnect supervisor active...\n");
-		printk("============================================================\n");
+#endif
 		break;
 	}
 	case NET_EVENT_IPV4_DHCP_START: {
@@ -1080,6 +1132,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 
 		for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
 			if (cfg->ip.ipv4->unicast[i].ipv4.addr_type == NET_ADDR_DHCP ||
+			    cfg->ip.ipv4->unicast[i].ipv4.addr_type == NET_ADDR_MANUAL ||
 			    cfg->ip.ipv4->unicast[i].ipv4.is_used) {
 				net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[i].ipv4.address.in_addr,
 				              ip_buf, sizeof(ip_buf));
@@ -1132,16 +1185,7 @@ static void trigger_wifi_connect(void)
 		return;
 	}
 
-	/* If a previous connection was in progress, issue DISCONNECT to cleanly reset driver state */
-	if (wifi_connecting) {
-		printk("[Wi-Fi] Resetting Wi-Fi driver state before initiating fresh connect...\n");
-		net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
-		k_msleep(250);
-		wifi_connecting = false;
-	}
-
 	wifi_attempt_count++;
-	last_connect_start_ms = k_uptime_get();
 	wifi_connecting = true;
 
 	char mac_str[18] = "Unknown MAC";
@@ -1156,7 +1200,6 @@ static void trigger_wifi_connect(void)
 	const char *sec_str = "Open";
 
 	if (strlen(CONFIG_APP_WIFI_PSK) > 0) {
-		/* Enforce WPA2-PSK compatibility (router will fall back from mixed WPA2/WPA3 to standard WPA2) */
 		sec_type = WIFI_SECURITY_TYPE_PSK;
 		sec_str = "WPA2-PSK";
 	}
@@ -1165,8 +1208,16 @@ static void trigger_wifi_connect(void)
 	printk("[Wi-Fi] Initiating connection attempt #%u...\n", wifi_attempt_count);
 	printk("[Wi-Fi]   Target SSID : %s\n", CONFIG_APP_WIFI_SSID);
 	printk("[Wi-Fi]   Security    : %s\n", sec_str);
+#if defined(CONFIG_APP_STATIC_IP)
+	if (sizeof(CONFIG_APP_STATIC_IP) > 1 && CONFIG_APP_STATIC_IP[0] != '\0') {
+		printk("[Wi-Fi]   IPv4 Mode   : Static IP (%s)\n", CONFIG_APP_STATIC_IP);
+	} else {
+		printk("[Wi-Fi]   IPv4 Mode   : DHCPv4 (Dynamic)\n");
+	}
+#else
+	printk("[Wi-Fi]   IPv4 Mode   : DHCPv4 (Dynamic)\n");
+#endif
 	printk("[Wi-Fi]   Station MAC : %s\n", mac_str);
-	printk("[Wi-Fi]   Band        : 2.4 GHz (802.11 b/g/n)\n");
 	printk("[Wi-Fi] -----------------------------------------------------\n");
 
 	struct wifi_connect_req_params params = {
@@ -1174,18 +1225,15 @@ static void trigger_wifi_connect(void)
 		.ssid_length = strlen(CONFIG_APP_WIFI_SSID),
 		.psk = CONFIG_APP_WIFI_PSK,
 		.psk_length = strlen(CONFIG_APP_WIFI_PSK),
-		.channel = WIFI_CHANNEL_ANY,
+		.channel = 0,
 		.security = sec_type,
-		.band = WIFI_FREQ_BAND_2_4_GHZ,
-		.mfp = WIFI_MFP_OPTIONAL,
 	};
 
+	printk("[Wi-Fi] Connecting to SSID: '%s'...\n", CONFIG_APP_WIFI_SSID);
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
 	if (ret) {
 		wifi_connecting = false;
-		printk("[Wi-Fi] ERROR: Connect request failed immediately (err: %d)\n", ret);
-	} else {
-		printk("[Wi-Fi] Connect request queued. Waiting for association callback...\n");
+		printk("[Wi-Fi] Connect request returned: %d\n", ret);
 	}
 }
 
@@ -1226,6 +1274,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		sse_clients[i].last_sent_id = 0;
 	}
 
+	int64_t last_reconnect_attempt = k_uptime_get();
+
 	/* Trigger initial connection attempt */
 	trigger_wifi_connect();
 
@@ -1233,38 +1283,13 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		int64_t now = k_uptime_get();
 		sync_time_to_app_cpu(now, false);
 
-		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
-		if (!wifi_connected) {
-			if (wifi_connecting) {
-				/* Watchdog: If in-flight connection has been waiting > 15s without driver callback, reset and retry */
-				if (now - last_connect_start_ms > 15000) {
-					printk("[Wi-Fi] Connection attempt timed out (15s). Retrying...\n");
-					trigger_wifi_connect();
-				}
-			} else {
-				/* If disconnected and not connecting, wait 10s between attempts */
-				if (now - last_connect_start_ms > 10000) {
-					trigger_wifi_connect();
-				}
-			}
+		/* Auto-reconnect supervisor: If Wi-Fi is lost, retry every 5 seconds (matching ESP32-C5) */
+		if (!wifi_connected && (now - last_reconnect_attempt > 5000)) {
+			last_reconnect_attempt = now;
+			trigger_wifi_connect();
 		}
 
 		if (!wifi_has_ip) {
-			if (wifi_connected && (now - last_dhcp_log > 10000)) {
-				last_dhcp_log = now;
-#if defined(CONFIG_APP_WIFI_SSID)
-				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease from router...\n",
-				       CONFIG_APP_WIFI_SSID);
-#endif
-				/* If waiting > 30s without DHCP lease, re-trigger DHCP Discover */
-				if (now - last_connect_start_ms > 30000) {
-					struct net_if *iface = net_if_get_default();
-					if (iface) {
-						net_dhcpv4_restart(iface);
-					}
-				}
-			}
-
 			if (server_fd >= 0) {
 				close(server_fd);
 				server_fd = -1;

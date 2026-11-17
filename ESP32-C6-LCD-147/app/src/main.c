@@ -1195,6 +1195,8 @@ static struct net_mgmt_event_callback wifi_mgmt_cb;
 static struct net_mgmt_event_callback ipv4_mgmt_cb;
 static uint32_t wifi_attempt_count = 0;
 static volatile bool wifi_connecting = false;
+static int64_t last_connect_start_ms = 0;
+static int64_t last_reconnect_attempt = 0;
 
 static void trigger_wifi_connect(void)
 {
@@ -1204,12 +1206,14 @@ static void trigger_wifi_connect(void)
 		return;
 	}
 
-	if (wifi_connected) {
+	/* Guard: Never invoke connect if already connected or if a connection is actively in flight */
+	if (wifi_connected || wifi_connecting) {
 		return;
 	}
 
 	wifi_attempt_count++;
 	wifi_connecting = true;
+	last_connect_start_ms = k_uptime_get();
 
 	char mac_str[18] = "Unknown MAC";
 	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
@@ -1232,10 +1236,20 @@ static void trigger_wifi_connect(void)
 	enum wifi_security_type sec_type = (psk_len > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE;
 	const char *sec_str = (psk_len > 0) ? "WPA2-PSK" : "Open";
 
+	uint8_t target_channel = 0;
+#if defined(CONFIG_APP_WIFI_CHANNEL)
+	target_channel = (uint8_t)CONFIG_APP_WIFI_CHANNEL;
+#endif
+
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
 	printk("[Wi-Fi] Connection Attempt #%u\n", wifi_attempt_count);
 	printk("[Wi-Fi]   SSID        : '%s'\n", ssid);
 	printk("[Wi-Fi]   Security    : %s\n", sec_str);
+	if (target_channel > 0) {
+		printk("[Wi-Fi]   Target CH   : Channel %u (Fast-Connect)\n", target_channel);
+	} else {
+		printk("[Wi-Fi]   Target CH   : All Channels (Scan)\n");
+	}
 #if defined(CONFIG_APP_STATIC_IP)
 	if (sizeof(CONFIG_APP_STATIC_IP) > 1 && CONFIG_APP_STATIC_IP[0] != '\0') {
 		printk("[Wi-Fi]   IPv4 Mode   : Static IP (%s)\n", CONFIG_APP_STATIC_IP);
@@ -1253,7 +1267,7 @@ static void trigger_wifi_connect(void)
 		.ssid_length = strlen(ssid),
 		.psk = (const uint8_t *)psk,
 		.psk_length = psk_len,
-		.channel = 0,
+		.channel = target_channel,
 		.security = sec_type,
 	};
 
@@ -1353,9 +1367,10 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 			wifi_connected = false;
 			wifi_has_ip = false;
 			wifi_ip_addr[0] = '\0';
+			last_reconnect_attempt = k_uptime_get();
 			int code = status ? status->status : -1;
 			printk("\n============================================================\n");
-			printk("[Wi-Fi] Connection failed with status: %d, will retry...\n", code);
+			printk("[Wi-Fi] Connection failed with status: %d, will retry in 10s...\n", code);
 			printk("============================================================\n");
 		}
 		break;
@@ -1368,6 +1383,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		wifi_connecting = false;
 		wifi_has_ip = false;
 		wifi_ip_addr[0] = '\0';
+		last_reconnect_attempt = k_uptime_get();
 #if defined(CONFIG_APP_STATIC_IP)
 		if (sizeof(CONFIG_APP_STATIC_IP) > 1 && CONFIG_APP_STATIC_IP[0] != '\0') {
 			struct in_addr ip_addr;
@@ -1468,7 +1484,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	int server_fd = -1;
 
-	int64_t last_reconnect_attempt = k_uptime_get();
+	last_reconnect_attempt = k_uptime_get();
 
 	/* Trigger initial connection attempt */
 	trigger_wifi_connect();
@@ -1476,10 +1492,23 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	while (1) {
 		int64_t now = k_uptime_get();
 
-		/* Auto-reconnect supervisor: If Wi-Fi is lost, retry every 5 seconds (matching ESP32-C5) */
-		if (!wifi_connected && (now - last_reconnect_attempt > 5000)) {
-			last_reconnect_attempt = now;
-			trigger_wifi_connect();
+		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
+		if (!wifi_connected) {
+			if (wifi_connecting) {
+				/* Watchdog: If in-flight connection has been waiting > 15s without driver callback, reset driver state */
+				if (now - last_connect_start_ms > 15000) {
+					printk("[Wi-Fi] Connection attempt timed out (15s). Resetting driver state...\n");
+					net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+					wifi_connecting = false;
+					last_reconnect_attempt = now;
+				}
+			} else {
+				/* If disconnected and idle, retry every 10 seconds */
+				if (now - last_reconnect_attempt > 10000) {
+					last_reconnect_attempt = now;
+					trigger_wifi_connect();
+				}
+			}
 		}
 
 		/* If disconnected or IP lost, clean up dead client sockets */
