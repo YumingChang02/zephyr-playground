@@ -1382,6 +1382,18 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		printk("============================================================\n");
 		break;
 	}
+	case NET_EVENT_IPV4_DHCP_START: {
+		printk("[DHCP] Client active: sending DHCP Discover to router...\n");
+		break;
+	}
+	case NET_EVENT_IPV4_DHCP_BOUND: {
+		printk("[DHCP] Offer accepted: DHCPv4 lease acquired successfully!\n");
+		break;
+	}
+	case NET_EVENT_IPV4_DHCP_STOP: {
+		printk("[DHCP] Client stopped.\n");
+		break;
+	}
 	case NET_EVENT_IPV4_ADDR_ADD: {
 		struct net_if_config *cfg = net_if_get_config(iface);
 		if (!cfg || !cfg->ip.ipv4) {
@@ -1449,7 +1461,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	net_mgmt_add_event_callback(&wifi_mgmt_cb);
 
 	net_mgmt_init_event_callback(&ipv4_mgmt_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
+	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL |
+	                             NET_EVENT_IPV4_DHCP_START | NET_EVENT_IPV4_DHCP_BOUND |
+	                             NET_EVENT_IPV4_DHCP_STOP);
 	net_mgmt_add_event_callback(&ipv4_mgmt_cb);
 
 	for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
@@ -1498,12 +1512,13 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 		/* If associated but waiting for DHCP IPv4 address */
 		if (!wifi_has_ip) {
-			if (wifi_connected && (now - last_dhcp_log > 5000)) {
+			if (wifi_connected && (now - last_dhcp_log > 8000)) {
 				last_dhcp_log = now;
 #if defined(CONFIG_APP_WIFI_SSID)
-				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease...\n",
+				printk("[Wi-Fi] Associated with AP '%s'. Requesting DHCP lease renewal...\n",
 				       CONFIG_APP_WIFI_SSID);
 #endif
+				net_dhcpv4_restart(iface);
 			}
 			/* Clean up sockets if disconnected */
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
