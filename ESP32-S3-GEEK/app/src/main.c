@@ -151,6 +151,7 @@ static volatile bool wifi_connected = false;
 static volatile bool wifi_connecting = false;
 static volatile bool wifi_has_ip = false;
 static char assigned_ipv4_str[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+static volatile int64_t last_dhcp_log = 0;
 static int64_t last_connect_start_ms = 0;
 static uint32_t wifi_attempt_count = 0;
 static struct net_mgmt_event_callback wifi_cb;
@@ -1009,6 +1010,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		if (status->status == 0) {
 			wifi_connected = true;
+			last_dhcp_log = k_uptime_get();
 			printk("\n============================================================\n");
 			printk("[Wi-Fi] Association SUCCESSFUL!\n");
 			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
@@ -1016,6 +1018,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 			       wifi_conn_status_txt(status->conn_status), status->status);
 			printk("[Wi-Fi]   Link State  : UP -> Requesting DHCP IPv4 address...\n");
 			printk("============================================================\n");
+			net_dhcpv4_start(iface);
 		} else {
 			wifi_connected = false;
 			wifi_has_ip = false;
@@ -1039,6 +1042,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		wifi_connecting = false;
 		wifi_has_ip = false;
 		assigned_ipv4_str[0] = '\0';
+		net_dhcpv4_stop(iface);
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
 		printk("\n============================================================\n");
 		printk("[Wi-Fi] Disconnected from AP!\n");
@@ -1051,6 +1055,18 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		printk("[Wi-Fi]   State       : Network down, auto-reconnect supervisor active...\n");
 		printk("============================================================\n");
+		break;
+	}
+	case NET_EVENT_IPV4_DHCP_START: {
+		printk("[DHCP] Client active: sending DHCP Discover to router...\n");
+		break;
+	}
+	case NET_EVENT_IPV4_DHCP_BOUND: {
+		printk("[DHCP] Offer accepted: DHCPv4 lease acquired successfully!\n");
+		break;
+	}
+	case NET_EVENT_IPV4_DHCP_STOP: {
+		printk("[DHCP] Client stopped.\n");
 		break;
 	}
 	case NET_EVENT_IPV4_ADDR_ADD: {
@@ -1140,19 +1156,9 @@ static void trigger_wifi_connect(void)
 	const char *sec_str = "Open";
 
 	if (strlen(CONFIG_APP_WIFI_PSK) > 0) {
-#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
-		/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
-		if ((wifi_attempt_count % 2) == 0) {
-			sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
-			sec_str = "WPA3-SAE (Auto)";
-		} else {
-			sec_type = WIFI_SECURITY_TYPE_PSK;
-			sec_str = "WPA2-PSK";
-		}
-#else
+		/* Enforce WPA2-PSK compatibility (router will fall back from mixed WPA2/WPA3 to standard WPA2) */
 		sec_type = WIFI_SECURITY_TYPE_PSK;
 		sec_str = "WPA2-PSK";
-#endif
 	}
 
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
@@ -1208,10 +1214,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	net_mgmt_add_event_callback(&wifi_cb);
 
 	net_mgmt_init_event_callback(&ipv4_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
+	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL |
+	                             NET_EVENT_IPV4_DHCP_START | NET_EVENT_IPV4_DHCP_BOUND |
+	                             NET_EVENT_IPV4_DHCP_STOP);
 	net_mgmt_add_event_callback(&ipv4_cb);
 
-	int64_t last_dhcp_log = 0;
 	int server_fd = -1;
 	sse_client_t sse_clients[MAX_SSE_CLIENTS];
 	for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
@@ -1229,9 +1236,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
 		if (!wifi_connected) {
 			if (wifi_connecting) {
-				/* Watchdog: If in-flight connection has been waiting > 20s without driver callback, reset and retry */
-				if (now - last_connect_start_ms > 20000) {
-					printk("[Wi-Fi] Connection attempt timed out (20s). Retrying with clean state...\n");
+				/* Watchdog: If in-flight connection has been waiting > 15s without driver callback, reset and retry */
+				if (now - last_connect_start_ms > 15000) {
+					printk("[Wi-Fi] Connection attempt timed out (15s). Retrying...\n");
 					trigger_wifi_connect();
 				}
 			} else {
@@ -1243,10 +1250,19 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		}
 
 		if (!wifi_has_ip) {
-			if (wifi_connected && (now - last_dhcp_log > 5000)) {
+			if (wifi_connected && (now - last_dhcp_log > 10000)) {
 				last_dhcp_log = now;
-				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease...\n",
+#if defined(CONFIG_APP_WIFI_SSID)
+				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease from router...\n",
 				       CONFIG_APP_WIFI_SSID);
+#endif
+				/* If waiting > 30s without DHCP lease, re-trigger DHCP Discover */
+				if (now - last_connect_start_ms > 30000) {
+					struct net_if *iface = net_if_get_default();
+					if (iface) {
+						net_dhcpv4_restart(iface);
+					}
+				}
 			}
 
 			if (server_fd >= 0) {

@@ -22,6 +22,7 @@
 #include <zephyr/net/socket.h>
 #include <zephyr/net/sntp.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/byteorder.h>
 #include <zephyr/spinlock.h>
 #include <ff.h>
 
@@ -509,7 +510,8 @@ static uint16_t g_time_buf[TIME_PANEL_W * TIME_PANEL_H];
 
 static inline uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
-	return ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F);
+	uint16_t c = ((r & 0x1F) << 11) | ((g & 0x3F) << 5) | (b & 0x1F);
+	return sys_cpu_to_be16(c);
 }
 
 /* 6x11 Monochrome Font with Numbers, Delimiters and Quotes */
@@ -586,20 +588,28 @@ static void draw_string(uint16_t *buf, int buf_w, int buf_h,
 	}
 }
 
-static void render_gauge_bar(int x, int y, uint32_t pct, uint16_t bar_color)
+static void render_gauge_bar(int x, int y, uint32_t pct, uint16_t fill_color)
 {
-	if (pct > 100) pct = 100;
-	int fill_w = (int)(((uint64_t)pct * (GAUGE_BAR_W - 4)) / 100);
+	if (pct > 100) {
+		pct = 100;
+	}
+
+	uint16_t border_color = rgb565(14, 28, 14);
+	uint16_t empty_color  = rgb565(0, 0, 0);
+	uint32_t fill_w = (pct * (GAUGE_BAR_W - 2)) / 100;
 
 	for (int row = 0; row < GAUGE_BAR_H; row++) {
 		for (int col = 0; col < GAUGE_BAR_W; col++) {
 			int idx = row * GAUGE_BAR_W + col;
 			if (row == 0 || row == GAUGE_BAR_H - 1 || col == 0 || col == GAUGE_BAR_W - 1) {
-				g_bar_buf[idx] = rgb565(8, 16, 8); /* Subtle border */
-			} else if (col >= 2 && col < 2 + fill_w && row >= 2 && row < GAUGE_BAR_H - 2) {
-				g_bar_buf[idx] = bar_color;
+				g_bar_buf[idx] = border_color;
 			} else {
-				g_bar_buf[idx] = rgb565(0, 0, 0); /* Pure Black */
+				int inner_col = col - 1;
+				if ((uint32_t)inner_col < fill_w) {
+					g_bar_buf[idx] = fill_color;
+				} else {
+					g_bar_buf[idx] = empty_color;
+				}
 			}
 		}
 	}
@@ -616,41 +626,74 @@ static void render_gauge_bar(int x, int y, uint32_t pct, uint16_t bar_color)
 
 static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
                               uint8_t hour, uint8_t min, uint8_t sec,
+                              bool is_synced,
                               uint8_t stage, uint32_t rem_sec)
 {
-	for (int i = 0; i < TIME_PANEL_W * TIME_PANEL_H; i++) {
-		g_time_buf[i] = rgb565(2, 4, 2); /* Deep Slate Background */
+	uint16_t border_col = rgb565(14, 28, 14);
+	uint16_t bg_col     = rgb565(0, 0, 0);
+
+	for (int row = 0; row < TIME_PANEL_H; row++) {
+		for (int col = 0; col < TIME_PANEL_W; col++) {
+			int idx = row * TIME_PANEL_W + col;
+			if (row == 0 || row == TIME_PANEL_H - 1 || col == 0 || col == TIME_PANEL_W - 1) {
+				g_time_buf[idx] = border_col;
+			} else {
+				g_time_buf[idx] = bg_col;
+			}
+		}
 	}
 
-	/* Top: Date MM/DD (or "--/--" if NTP not synced yet) */
 	char date_str[12];
-	if (mon == 0 || day == 0) {
+	char time_str[12];
+	if (!is_synced || mon == 0 || day == 0) {
 		snprintf(date_str, sizeof(date_str), "--/--");
 	} else {
 		snprintf(date_str, sizeof(date_str), "%02u/%02u", mon, day);
 	}
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 29, 36, date_str, rgb565(0, 56, 31));
-
-	/* Mid: HH:MM:SS */
-	char time_str[12];
 	snprintf(time_str, sizeof(time_str), "%02u:%02u:%02u", hour, min, sec);
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 19, 78, time_str, rgb565(31, 55, 0));
 
-	/* Bottom: Stage Remaining MM' SS'' */
+	/* Top Sync Indicator (at y = 20) */
+	if (is_synced) {
+		draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 37, 20, "NTP", rgb565(0, 50, 10));
+	} else {
+		draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 33, 20, "SYNC", rgb565(20, 25, 0));
+	}
+
+	/* Date MM/DD (5 chars * 7 - 1 = 34 px wide) -> centered in 94 px: (94 - 34) / 2 = 30 (at y = 56) */
+	uint16_t date_color = rgb565(0, 56, 31); /* Cool Mint / Cyan */
+	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 30, 56, date_str, date_color);
+
+	/* Time HH:MM:SS (8 chars * 7 - 1 = 55 px wide) -> centered in 94 px: (94 - 55) / 2 = 19 (at y = 92) */
+	uint16_t time_color = rgb565(31, 55, 0); /* Warm Amber / Gold */
+	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 19, 92, time_str, time_color);
+
+	/* Bottom: Stage Remaining Countdown MM' SS'' (at y = 130) */
 	uint16_t stage_col;
 	switch (stage) {
-	case PROFILE_STAGE_LOW:  stage_col = rgb565(9, 49, 31);  break; /* Cyan */
-	case PROFILE_STAGE_UP:   stage_col = rgb565(31, 46, 10); break; /* Amber */
-	case PROFILE_STAGE_HIGH: stage_col = rgb565(16, 50, 16); break; /* Green */
-	case PROFILE_STAGE_DROP: stage_col = rgb565(31, 14, 14); break; /* Red */
-	default:                 stage_col = rgb565(14, 28, 14); break; /* Grey */
+	case PROFILE_STAGE_LOW:
+		stage_col = rgb565(9, 49, 31);   /* Cyan / Sky Blue (Stage 1: Low)   */
+		break;
+	case PROFILE_STAGE_UP:
+		stage_col = rgb565(31, 46, 10);  /* Amber / Gold (Stage 2: Ramp Up)  */
+		break;
+	case PROFILE_STAGE_HIGH:
+		stage_col = rgb565(16, 50, 16);  /* Vibrant Green (Stage 3: High)    */
+		break;
+	case PROFILE_STAGE_DROP:
+		stage_col = rgb565(31, 14, 14);  /* Coral Red (Stage 4: Drop)        */
+		break;
+	default:
+		stage_col = rgb565(14, 28, 14);  /* Dim Grey (Idle)                  */
+		break;
 	}
 
 	char rem_str[16];
 	if (stage != PROFILE_STAGE_IDLE) {
 		uint32_t mm = rem_sec / 60;
 		uint32_t ss = rem_sec % 60;
-		if (mm > 99) mm = 99;
+		if (mm > 99) {
+			mm = 99;
+		}
 		snprintf(rem_str, sizeof(rem_str), "%02u' %02u''", mm, ss);
 	} else {
 		snprintf(rem_str, sizeof(rem_str), "--' --''");
@@ -658,8 +701,10 @@ static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
 	int str_len = strlen(rem_str);
 	int text_w = str_len * 7 - 1;
 	int start_x = (TIME_PANEL_W - text_w) / 2;
-	if (start_x < 2) start_x = 2;
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, start_x, 120, rem_str, stage_col);
+	if (start_x < 2) {
+		start_x = 2;
+	}
+	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, start_x, 130, rem_str, stage_col);
 
 	struct display_buffer_descriptor desc = {
 		.buf_size = sizeof(g_time_buf),
@@ -812,6 +857,7 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		render_time_panel(TIME_PANEL_X, TIME_PANEL_Y,
 		                  disp_mon, disp_day,
 		                  disp_hour, disp_min, disp_sec,
+		                  synced,
 		                  stage, rem_sec);
 
 		k_msleep(100); /* 10 Hz refresh */
@@ -1152,12 +1198,6 @@ static uint32_t wifi_attempt_count = 0;
 static volatile bool wifi_connecting = false;
 static int64_t last_connect_start_ms = 0;
 
-static volatile bool g_target_ap_found = false;
-static volatile uint8_t g_target_channel = 0;
-static volatile enum wifi_security_type g_target_security = WIFI_SECURITY_TYPE_PSK;
-static K_SEM_DEFINE(wifi_scan_done_sem, 0, 1);
-static uint32_t scan_ap_count = 0;
-
 static void trigger_wifi_connect(void)
 {
 	struct net_if *iface = net_if_get_default();
@@ -1200,42 +1240,15 @@ static void trigger_wifi_connect(void)
 	const char *psk = CONFIG_APP_WIFI_PSK;
 	size_t psk_len = strlen(psk);
 
-	uint8_t target_chan = g_target_ap_found ? g_target_channel : WIFI_CHANNEL_ANY;
-	enum wifi_security_type sec_type = WIFI_SECURITY_TYPE_NONE;
-	const char *sec_str = "Open";
-
-	if (psk_len > 0) {
-		if (g_target_ap_found) {
-			sec_type = g_target_security;
-			sec_str = wifi_security_txt(sec_type);
-		} else {
-#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
-			/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
-			if ((wifi_attempt_count % 2) == 0) {
-				sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
-				sec_str = "WPA3-SAE (Auto)";
-			} else {
-				sec_type = WIFI_SECURITY_TYPE_PSK;
-				sec_str = "WPA2-PSK";
-			}
-#else
-			sec_type = WIFI_SECURITY_TYPE_PSK;
-			sec_str = "WPA2-PSK";
-#endif
-		}
-	}
+	enum wifi_security_type sec_type = (psk_len > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE;
+	const char *sec_str = (psk_len > 0) ? "WPA2-PSK" : "Open";
 
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
 	printk("[Wi-Fi] Connection Attempt #%u\n", wifi_attempt_count);
 	printk("[Wi-Fi]   SSID        : '%s'\n", ssid);
 	printk("[Wi-Fi]   Security    : %s\n", sec_str);
-	if (target_chan != WIFI_CHANNEL_ANY) {
-		printk("[Wi-Fi]   Target CH   : %u (Locked from Site Survey)\n", target_chan);
-	} else {
-		printk("[Wi-Fi]   Target CH   : All Channels (Scan)\n");
-	}
 	printk("[Wi-Fi]   Station MAC : %s\n", mac_str);
-	printk("[Wi-Fi]   Band        : 2.4 GHz (Wi-Fi 6 / 802.11b/g/n/ax)\n");
+	printk("[Wi-Fi]   Band        : 2.4 GHz (802.11 b/g/n/ax)\n");
 	printk("[Wi-Fi] -----------------------------------------------------\n");
 
 	struct wifi_connect_req_params params = {
@@ -1243,7 +1256,7 @@ static void trigger_wifi_connect(void)
 		.ssid_length = strlen(ssid),
 		.psk = (const uint8_t *)psk,
 		.psk_length = psk_len,
-		.channel = target_chan,
+		.channel = WIFI_CHANNEL_ANY,
 		.security = sec_type,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
 		.mfp = WIFI_MFP_OPTIONAL,
@@ -1252,11 +1265,7 @@ static void trigger_wifi_connect(void)
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
 	if (ret != 0) {
 		wifi_connecting = false;
-		printk("[Wi-Fi] ERROR: Connect request rejected immediately by stack (err: %d - %s)\n",
-		       ret, ret == -EALREADY ? "Connection in progress" :
-		            ret == -EBUSY ? "Device busy" :
-		            ret == -EINVAL ? "Invalid parameters" :
-		            ret == -ENETDOWN ? "Interface down" : "Check Wi-Fi configuration");
+		printk("[Wi-Fi] ERROR: Connect request rejected immediately by stack (err: %d)\n", ret);
 	} else {
 		printk("[Wi-Fi] Connect request queued to Wi-Fi driver. Awaiting association...\n");
 	}
@@ -1266,65 +1275,10 @@ static void trigger_wifi_connect(void)
 #endif
 }
 
-static bool str_case_eq(const char *s1, const char *s2)
-{
-	if (!s1 || !s2) return false;
-	while (*s1 && *s2) {
-		if (tolower((unsigned char)*s1) != tolower((unsigned char)*s2)) {
-			return false;
-		}
-		s1++;
-		s2++;
-	}
-	return (*s1 == '\0' && *s2 == '\0');
-}
-
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
                                     uint64_t mgmt_event, struct net_if *iface)
 {
 	switch (mgmt_event) {
-	case NET_EVENT_WIFI_SCAN_RESULT: {
-		const struct wifi_scan_result *entry = (const struct wifi_scan_result *)cb->info;
-		if (!entry || entry->ssid_length == 0) {
-			break;
-		}
-		scan_ap_count++;
-		char s_ssid[WIFI_SSID_MAX_LEN + 1];
-		size_t slen = entry->ssid_length < WIFI_SSID_MAX_LEN ? entry->ssid_length : WIFI_SSID_MAX_LEN;
-		memcpy(s_ssid, entry->ssid, slen);
-		s_ssid[slen] = '\0';
-
-		printk("[Wi-Fi Scan]   #%02u: '%s' | Ch %2u | RSSI %3d dBm | %s\n",
-		       scan_ap_count, s_ssid, entry->channel, entry->rssi,
-		       wifi_security_txt(entry->security));
-
-#if defined(CONFIG_APP_WIFI_SSID)
-		if (strcmp(s_ssid, CONFIG_APP_WIFI_SSID) == 0) {
-			g_target_ap_found = true;
-			g_target_channel = entry->channel;
-			g_target_security = entry->security;
-			printk("[Wi-Fi Scan]   >>> MATCH FOUND! Targeted AP '%s' on Channel %u\n",
-			       s_ssid, entry->channel);
-		} else if (str_case_eq(s_ssid, CONFIG_APP_WIFI_SSID)) {
-			printk("[Wi-Fi Scan]   >>> WARNING: CASE MISMATCH! Found '%s', but config has '%s'!\n",
-			       s_ssid, CONFIG_APP_WIFI_SSID);
-		}
-#endif
-		break;
-	}
-	case NET_EVENT_WIFI_SCAN_DONE: {
-		printk("[Wi-Fi Scan] -----------------------------------------------------\n");
-		printk("[Wi-Fi Scan] Survey complete. Total 2.4 GHz APs found: %u\n", scan_ap_count);
-#if defined(CONFIG_APP_WIFI_SSID)
-		if (!g_target_ap_found) {
-			printk("[Wi-Fi Scan] NOTICE: Target SSID '%s' was NOT detected.\n", CONFIG_APP_WIFI_SSID);
-			printk("[Wi-Fi Scan] Note: If using an iPhone/Android hotspot, ensure 'Maximize Compatibility' is enabled and the hotspot screen is active.\n");
-		}
-#endif
-		printk("[Wi-Fi Scan] -----------------------------------------------------\n");
-		k_sem_give(&wifi_scan_done_sem);
-		break;
-	}
 	case NET_EVENT_WIFI_CONNECT_RESULT: {
 		wifi_connecting = false;
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
@@ -1370,6 +1324,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		wifi_connecting = false;
 		wifi_has_ip = false;
 		wifi_ip_addr[0] = '\0';
+		net_dhcpv4_stop(iface);
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
 		printk("\n============================================================\n");
 		printk("[Wi-Fi] Disconnected from AP!\n");
@@ -1457,9 +1412,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
 	                             NET_EVENT_WIFI_CONNECT_RESULT |
-	                             NET_EVENT_WIFI_DISCONNECT_RESULT |
-	                             NET_EVENT_WIFI_SCAN_RESULT |
-	                             NET_EVENT_WIFI_SCAN_DONE);
+	                             NET_EVENT_WIFI_DISCONNECT_RESULT);
 	net_mgmt_add_event_callback(&wifi_mgmt_cb);
 
 	net_mgmt_init_event_callback(&ipv4_mgmt_cb, wifi_mgmt_event_handler,
@@ -1475,20 +1428,6 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	int server_fd = -1;
 
-	/* Run active 2.4 GHz site survey scan to verify spectrum & target channel */
-	if (iface) {
-		printk("\n[Wi-Fi Scan] Running 2.4 GHz site survey to locate '%s'...\n", CONFIG_APP_WIFI_SSID);
-		scan_ap_count = 0;
-		struct wifi_scan_params scan_params = {
-			.scan_type = WIFI_SCAN_TYPE_ACTIVE,
-			.bands = WIFI_FREQ_BAND_2_4_GHZ,
-		};
-		int s_rc = net_mgmt(NET_REQUEST_WIFI_SCAN, iface, &scan_params, sizeof(scan_params));
-		if (s_rc == 0) {
-			k_sem_take(&wifi_scan_done_sem, K_SECONDS(5));
-		}
-	}
-
 	/* Trigger initial connection attempt */
 	trigger_wifi_connect();
 
@@ -1498,9 +1437,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
 		if (!wifi_connected) {
 			if (wifi_connecting) {
-				/* Watchdog: If in-flight connection has been waiting > 20s without driver callback, reset and retry */
-				if (now - last_connect_start_ms > 20000) {
-					printk("[Wi-Fi] Connection attempt timed out (20s). Retrying with clean state...\n");
+				/* Watchdog: If in-flight connection has been waiting > 15s without driver callback, reset and retry */
+				if (now - last_connect_start_ms > 15000) {
+					printk("[Wi-Fi] Connection attempt timed out (15s). Retrying...\n");
 					trigger_wifi_connect();
 				}
 			} else {
@@ -1519,6 +1458,10 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease from router...\n",
 				       CONFIG_APP_WIFI_SSID);
 #endif
+				/* If waiting > 30s without DHCP lease, re-trigger DHCP Discover */
+				if (now - last_connect_start_ms > 30000) {
+					net_dhcpv4_restart(iface);
+				}
 			}
 			/* Clean up sockets if disconnected */
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
