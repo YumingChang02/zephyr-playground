@@ -17,6 +17,7 @@
 #include <zephyr/drivers/display.h>
 #include <zephyr/fs/fs.h>
 #include <zephyr/net/net_if.h>
+#include <zephyr/net/wifi.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/sntp.h>
@@ -183,15 +184,23 @@ static bool g_csv_file_is_open = false;
 /* ========================================================================= */
 static void get_formatted_time(char *iso_buf, size_t iso_len, char *date_buf, size_t date_len)
 {
-	int64_t now_sec;
 	k_spinlock_key_t key = k_spin_lock(&time_spinlock);
-	if (ntp_synced) {
-		now_sec = ntp_epoch_sec + (k_uptime_get() - ntp_sync_uptime) / 1000;
-	} else {
-		now_sec = 1767225600LL + (k_uptime_get() / 1000);
-	}
+	bool synced = ntp_synced;
+	int64_t epoch = ntp_epoch_sec;
+	int64_t uptime_ref = ntp_sync_uptime;
 	k_spin_unlock(&time_spinlock, key);
 
+	if (!synced) {
+		if (iso_buf && iso_len > 0) {
+			snprintf(iso_buf, iso_len, "NTP_PENDING");
+		}
+		if (date_buf && date_len > 0) {
+			date_buf[0] = '\0';
+		}
+		return;
+	}
+
+	int64_t now_sec = epoch + (k_uptime_get() - uptime_ref) / 1000;
 	time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
 	struct tm tm_info;
 	gmtime_r(&t, &tm_info);
@@ -295,22 +304,26 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 
 		g_total_pulses += current_pulses;
 
-		/* Compute wall-clock second of day for 00:00:00 alignment */
-		int64_t now_sec;
+		/* Compute second of day for 00:00:00 alignment (or relative uptime if pending) */
+		uint32_t cur_sec_of_day;
 		k_spinlock_key_t tkey = k_spin_lock(&time_spinlock);
-		if (ntp_synced) {
-			now_sec = ntp_epoch_sec + (current_time_ms - ntp_sync_uptime) / 1000;
-		} else {
-			now_sec = 1767225600LL + (current_time_ms / 1000);
-		}
+		bool synced = ntp_synced;
+		int64_t epoch = ntp_epoch_sec;
+		int64_t uptime_ref = ntp_sync_uptime;
 		k_spin_unlock(&time_spinlock, tkey);
 
-		time_t t_local = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
-		struct tm tm_val;
-		gmtime_r(&t_local, &tm_val);
-		uint32_t cur_sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
-		                          (uint32_t)tm_val.tm_min * 60U +
-		                          (uint32_t)tm_val.tm_sec;
+		if (synced) {
+			int64_t now_sec = epoch + (current_time_ms - uptime_ref) / 1000;
+			time_t t_local = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
+			struct tm tm_val;
+			gmtime_r(&t_local, &tm_val);
+			cur_sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
+			                 (uint32_t)tm_val.tm_min * 60U +
+			                 (uint32_t)tm_val.tm_sec;
+		} else {
+			/* Before NTP lock, cycle profile from system boot uptime */
+			cur_sec_of_day = (uint32_t)(current_time_ms / 1000);
+		}
 
 		/* Read current profile configuration */
 		k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
@@ -460,8 +473,10 @@ static void sensor_aggregator_thread_fn(void *p1, void *p2, void *p3)
 		get_formatted_time(full.iso_time, sizeof(full.iso_time),
 		                   full.date_str, sizeof(full.date_str));
 
-		/* Enqueue to SD Card logger */
-		k_msgq_put(&csv_msgq, &full, K_NO_WAIT);
+		/* Enqueue to SD Card logger only after real wall-clock time is locked by NTP */
+		if (ntp_synced) {
+			k_msgq_put(&csv_msgq, &full, K_NO_WAIT);
+		}
 
 		/* Update latest telemetry for SSE clients */
 		k_spinlock_key_t key = k_spin_lock(&telemetry_spinlock);
@@ -604,9 +619,13 @@ static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
 		g_time_buf[i] = rgb565(2, 4, 2); /* Deep Slate Background */
 	}
 
-	/* Top: Date MM/DD */
+	/* Top: Date MM/DD (or "--/--" if NTP not synced yet) */
 	char date_str[12];
-	snprintf(date_str, sizeof(date_str), "%02u/%02u", mon, day);
+	if (mon == 0 || day == 0) {
+		snprintf(date_str, sizeof(date_str), "--/--");
+	} else {
+		snprintf(date_str, sizeof(date_str), "%02u/%02u", mon, day);
+	}
 	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 29, 36, date_str, rgb565(0, 56, 31));
 
 	/* Mid: HH:MM:SS */
@@ -649,6 +668,26 @@ static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
 	display_write(display_dev, x, y, &desc, g_time_buf);
 }
 
+static void clear_screen_black(void)
+{
+	memset(g_bar_buf, 0, sizeof(g_bar_buf));
+	const int strip_h = 20;
+	struct display_buffer_descriptor desc = {
+		.buf_size = LCD_W * strip_h * sizeof(uint16_t),
+		.width = LCD_W,
+		.height = strip_h,
+		.pitch = LCD_W,
+		.frame_incomplete = false,
+	};
+
+	for (int y = 0; y < LCD_H; y += strip_h) {
+		int h = (y + strip_h <= LCD_H) ? strip_h : (LCD_H - y);
+		desc.height = h;
+		desc.buf_size = LCD_W * h * sizeof(uint16_t);
+		display_write(display_dev, 0, y, &desc, g_bar_buf);
+	}
+}
+
 static void display_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -662,13 +701,19 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		return;
 	}
 
+	/* 1. Flush full 320x172 screen with solid black before turning on backlight or unblanking */
+	clear_screen_black();
+	printk("[Thread 3] LCD screen flushed to solid black\n");
+
+	/* 2. Unblank the display controller */
+	display_blanking_off(display_dev);
+
+	/* 3. Turn on backlight cleanly */
 	if (bl_spec.port && device_is_ready(bl_spec.port)) {
 		gpio_pin_configure_dt(&bl_spec, GPIO_OUTPUT_ACTIVE);
 		gpio_pin_set_dt(&bl_spec, 1);
 		printk("[Thread 3] LCD Backlight enabled on GPIO %d\n", bl_spec.pin);
 	}
-
-	display_blanking_off(display_dev);
 
 	uint16_t color_pwm   = rgb565(0, 63, 31); /* Top: Cyan (PWM Target %) */
 	uint16_t color_fg    = rgb565(0, 63, 0);  /* Mid: Green (FG RPM %) */
@@ -697,24 +742,39 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		render_gauge_bar(GAUGE_BAR_X, 58, s_smooth_fg, color_fg);
 		render_gauge_bar(GAUGE_BAR_X, 114, s_smooth_curr, color_curr);
 
-		/* Compute continuous local wall-clock time */
+		/* Compute continuous local time (real wall-clock if NTP locked, uptime if pending) */
 		int64_t now_ms = k_uptime_get();
-		int64_t now_sec;
 		k_spinlock_key_t key = k_spin_lock(&time_spinlock);
-		if (ntp_synced) {
-			now_sec = ntp_epoch_sec + (now_ms - ntp_sync_uptime) / 1000;
-		} else {
-			now_sec = 1767225600LL + (now_ms / 1000);
-		}
+		bool synced = ntp_synced;
+		int64_t epoch = ntp_epoch_sec;
+		int64_t uptime_ref = ntp_sync_uptime;
 		k_spin_unlock(&time_spinlock, key);
 
-		time_t t_local = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
-		struct tm tm_val;
-		gmtime_r(&t_local, &tm_val);
+		uint8_t disp_mon = 0, disp_day = 0;
+		uint8_t disp_hour = 0, disp_min = 0, disp_sec = 0;
+		uint32_t cur_sec_of_day;
 
-		uint32_t cur_sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
-		                          (uint32_t)tm_val.tm_min * 60U +
-		                          (uint32_t)tm_val.tm_sec;
+		if (synced) {
+			int64_t now_sec = epoch + (now_ms - uptime_ref) / 1000;
+			time_t t_local = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
+			struct tm tm_val;
+			gmtime_r(&t_local, &tm_val);
+			disp_mon  = (uint8_t)(tm_val.tm_mon + 1);
+			disp_day  = (uint8_t)tm_val.tm_mday;
+			disp_hour = (uint8_t)tm_val.tm_hour;
+			disp_min  = (uint8_t)tm_val.tm_min;
+			disp_sec  = (uint8_t)tm_val.tm_sec;
+			cur_sec_of_day = (uint32_t)disp_hour * 3600U +
+			                 (uint32_t)disp_min * 60U +
+			                 (uint32_t)disp_sec;
+		} else {
+			/* Elapsed uptime before NTP lock */
+			uint32_t up_s = (uint32_t)(now_ms / 1000);
+			disp_hour = (uint8_t)((up_s / 3600U) % 24U);
+			disp_min  = (uint8_t)((up_s % 3600U) / 60U);
+			disp_sec  = (uint8_t)(up_s % 60U);
+			cur_sec_of_day = up_s;
+		}
 
 		/* Compute remaining seconds in active stage */
 		k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
@@ -747,8 +807,8 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		}
 
 		render_time_panel(TIME_PANEL_X, TIME_PANEL_Y,
-		                  (uint8_t)(tm_val.tm_mon + 1), (uint8_t)tm_val.tm_mday,
-		                  (uint8_t)tm_val.tm_hour, (uint8_t)tm_val.tm_min, (uint8_t)tm_val.tm_sec,
+		                  disp_mon, disp_day,
+		                  disp_hour, disp_min, disp_sec,
 		                  stage, rem_sec);
 
 		k_msleep(100); /* 10 Hz refresh */
@@ -824,7 +884,7 @@ static void prune_old_csv_files(void)
 		int to_delete = count - 7;
 		for (int i = 0; i < to_delete; i++) {
 			char fullpath[128];
-			snprintf(fullpath, sizeof(fullpath), "/SD:/%s", csv_files[i]);
+			snprintf(fullpath, sizeof(fullpath), "/SD:/%.31s", csv_files[i]);
 			fs_unlink(fullpath);
 			printk("[SD Card] Pruned old log: %s\n", fullpath);
 		}
@@ -844,10 +904,21 @@ static void sd_logging_thread_fn(void *p1, void *p2, void *p3)
 	char current_day_str[24] = "";
 	fs_file_t_init(&g_csv_file);
 	int64_t last_mount_attempt = k_uptime_get();
+	static bool s_ntp_csv_ready = false;
 
 	while (1) {
 		telemetry_full_t packet;
 		k_msgq_get(&csv_msgq, &packet, K_FOREVER);
+
+		/* Wait until NTP locks real wall-clock time before creating/opening CSV file */
+		if (!ntp_synced) {
+			continue;
+		}
+
+		if (!s_ntp_csv_ready) {
+			s_ntp_csv_ready = true;
+			printk("[SD Card] NTP locked! Initializing daily CSV telemetry logging...\n");
+		}
 
 		if (!sdcard_mounted) {
 			int64_t now = k_uptime_get();
@@ -858,12 +929,7 @@ static void sd_logging_thread_fn(void *p1, void *p2, void *p3)
 			if (!sdcard_mounted) continue;
 		}
 
-		char day_str[24];
-		if (strlen(packet.date_str) > 0) {
-			strncpy(day_str, packet.date_str, sizeof(day_str));
-		} else {
-			get_formatted_time(NULL, 0, day_str, sizeof(day_str));
-		}
+		const char *day_str = packet.date_str;
 
 		/* Daily rotation */
 		if (strcmp(day_str, current_day_str) != 0) {
@@ -1074,44 +1140,276 @@ static int get_query_param_int(const char *req, const char *param, int default_v
 	return atoi(p);
 }
 
+/* ========================================================================= */
+/* Wi-Fi Management, Diagnostics & Auto-Reconnect Supervisor                */
+/* ========================================================================= */
+static struct net_mgmt_event_callback wifi_mgmt_cb;
+static struct net_mgmt_event_callback ipv4_mgmt_cb;
+static uint32_t wifi_attempt_count = 0;
+
+static void trigger_wifi_connect(void)
+{
+	struct net_if *iface = net_if_get_default();
+	if (!iface) {
+		printk("[Wi-Fi] ERROR: No default network interface found!\n");
+		return;
+	}
+
+	wifi_attempt_count++;
+
+	char mac_str[18] = "Unknown MAC";
+	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
+	if (link_addr && link_addr->len == 6) {
+		snprintk(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+		         link_addr->addr[0], link_addr->addr[1], link_addr->addr[2],
+		         link_addr->addr[3], link_addr->addr[4], link_addr->addr[5]);
+	}
+
+#if defined(CONFIG_APP_WIFI_SSID)
+	if (strlen(CONFIG_APP_WIFI_SSID) == 0) {
+		printk("[Wi-Fi] WARNING: CONFIG_APP_WIFI_SSID is empty! Please configure credentials.conf\n");
+		return;
+	}
+	const char *ssid = CONFIG_APP_WIFI_SSID;
+	const char *psk = CONFIG_APP_WIFI_PSK;
+	size_t psk_len = strlen(psk);
+	const char *sec_str = (psk_len > 0) ? "WPA2/WPA3-PSK" : "Open";
+
+	printk("\n[Wi-Fi] -----------------------------------------------------\n");
+	printk("[Wi-Fi] Connection Attempt #%u\n", wifi_attempt_count);
+	printk("[Wi-Fi]   SSID        : '%s'\n", ssid);
+	printk("[Wi-Fi]   Security    : %s\n", sec_str);
+	printk("[Wi-Fi]   Station MAC : %s\n", mac_str);
+	printk("[Wi-Fi]   Band        : 2.4 GHz (Wi-Fi 6 / 802.11b/g/n/ax)\n");
+	printk("[Wi-Fi] -----------------------------------------------------\n");
+
+	struct wifi_connect_req_params params = {
+		.ssid = (const uint8_t *)ssid,
+		.ssid_length = strlen(ssid),
+		.psk = (const uint8_t *)psk,
+		.psk_length = psk_len,
+		.channel = WIFI_CHANNEL_ANY,
+		.security = (psk_len > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
+		.band = WIFI_FREQ_BAND_2_4_GHZ,
+		.mfp = WIFI_MFP_OPTIONAL,
+	};
+
+	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
+	if (ret != 0) {
+		printk("[Wi-Fi] ERROR: Connect request rejected immediately by stack (err: %d - %s)\n",
+		       ret, ret == -EALREADY ? "Connection in progress" :
+		            ret == -EBUSY ? "Device busy" :
+		            ret == -EINVAL ? "Invalid parameters" :
+		            ret == -ENETDOWN ? "Interface down" : "Check Wi-Fi configuration");
+	} else {
+		printk("[Wi-Fi] Connect request queued to Wi-Fi driver. Awaiting association...\n");
+	}
+#else
+	printk("[Wi-Fi] WARNING: No SSID configured! Please configure credentials.conf\n");
+#endif
+}
+
+static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
+                                    uint64_t mgmt_event, struct net_if *iface)
+{
+	switch (mgmt_event) {
+	case NET_EVENT_WIFI_CONNECT_RESULT: {
+		const struct wifi_status *status = (const struct wifi_status *)cb->info;
+		if (!status) {
+			printk("[Wi-Fi] Event: CONNECT_RESULT (no status data)\n");
+			break;
+		}
+		if (status->status == 0) {
+			wifi_connected = true;
+			printk("\n============================================================\n");
+			printk("[Wi-Fi] Association SUCCESSFUL!\n");
+#if defined(CONFIG_APP_WIFI_SSID)
+			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
+#endif
+			printk("[Wi-Fi]   Status      : %s (code %d)\n",
+			       wifi_conn_status_txt(status->conn_status), status->status);
+			printk("[Wi-Fi]   Link State  : UP -> Requesting DHCP IPv4 address...\n");
+			printk("============================================================\n");
+			net_dhcpv4_start(iface);
+		} else {
+			wifi_connected = false;
+			wifi_has_ip = false;
+			wifi_ip_addr[0] = '\0';
+			printk("\n============================================================\n");
+			printk("[Wi-Fi] Association FAILED!\n");
+#if defined(CONFIG_APP_WIFI_SSID)
+			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
+#endif
+			printk("[Wi-Fi]   Status      : %s (code %d)\n",
+			       wifi_conn_status_txt(status->conn_status), status->status);
+			if (status->status_code != 0 || status->reason_code != 0) {
+				printk("[Wi-Fi]   802.11 Code : Status=%u, Reason=%u\n",
+				       status->status_code, status->reason_code);
+			}
+			printk("[Wi-Fi]   Action      : Auto-reconnect supervisor will retry in 10s...\n");
+			printk("============================================================\n");
+		}
+		break;
+	}
+	case NET_EVENT_WIFI_DISCONNECT_RESULT: {
+		wifi_connected = false;
+		wifi_has_ip = false;
+		wifi_ip_addr[0] = '\0';
+		const struct wifi_status *status = (const struct wifi_status *)cb->info;
+		printk("\n============================================================\n");
+		printk("[Wi-Fi] Disconnected from AP!\n");
+		if (status) {
+			printk("[Wi-Fi]   Reason      : %s (code %d)\n",
+			       wifi_disconn_reason_txt(status->disconn_reason), status->status);
+			if (status->reason_code != 0) {
+				printk("[Wi-Fi]   802.11 Reason: %u\n", status->reason_code);
+			}
+		}
+		printk("[Wi-Fi]   Action      : Network down, auto-reconnect supervisor active...\n");
+		printk("============================================================\n");
+		break;
+	}
+	case NET_EVENT_IPV4_ADDR_ADD: {
+		struct net_if_config *cfg = net_if_get_config(iface);
+		if (!cfg || !cfg->ip.ipv4) {
+			break;
+		}
+		for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
+			if (cfg->ip.ipv4->unicast[i].ipv4.addr_type == NET_ADDR_DHCP ||
+			    cfg->ip.ipv4->unicast[i].ipv4.is_used) {
+				char ip_str[INET_ADDRSTRLEN];
+				net_addr_ntop(AF_INET,
+				              &cfg->ip.ipv4->unicast[i].ipv4.address.in_addr,
+				              ip_str, sizeof(ip_str));
+				strncpy(wifi_ip_addr, ip_str, sizeof(wifi_ip_addr) - 1);
+				wifi_has_ip = true;
+
+				char nm_str[INET_ADDRSTRLEN] = "0.0.0.0";
+				char gw_str[INET_ADDRSTRLEN] = "0.0.0.0";
+				net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[i].netmask,
+				              nm_str, sizeof(nm_str));
+				net_addr_ntop(AF_INET, &cfg->ip.ipv4->gw,
+				              gw_str, sizeof(gw_str));
+
+				printk("\n=================================================================\n");
+				printk(">>> ESP32-C6-LCD-1.47 Web Dashboard is LIVE! <<<\n");
+				printk("=================================================================\n");
+				printk("  [IP Address]   : %s\n", ip_str);
+				printk("  [Subnet Mask]  : %s\n", nm_str);
+				printk("  [Gateway]      : %s\n", gw_str);
+				printk("  [Web URL]      : http://%s/\n", ip_str);
+				printk("  [SSE Stream]   : http://%s/events\n", ip_str);
+				printk("  [Download CSV] : http://%s/api/download/csv\n", ip_str);
+				printk("=================================================================\n\n");
+				k_sem_give(&ntp_trigger_sem);
+				break;
+			}
+		}
+		break;
+	}
+	case NET_EVENT_IPV4_ADDR_DEL: {
+		printk("[Wi-Fi] IPv4 address lease released / expired (%s)\n", wifi_ip_addr);
+		wifi_ip_addr[0] = '\0';
+		wifi_has_ip = false;
+		break;
+	}
+	default:
+		break;
+	}
+}
+
 static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	printk("[Thread 5: HTTP Server] Started (Priority %d)\n", PRIORITY_WIFI_HTTP);
+	printk("[Thread 5: HTTP Server & Wi-Fi] Started (Priority %d)\n", PRIORITY_WIFI_HTTP);
+
+	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
+	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
+	net_mgmt_add_event_callback(&wifi_mgmt_cb);
+
+	net_mgmt_init_event_callback(&ipv4_mgmt_cb, wifi_mgmt_event_handler,
+	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
+	net_mgmt_add_event_callback(&ipv4_mgmt_cb);
 
 	for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 		sse_clients[i].fd = -1;
 		sse_clients[i].last_sent_id = 0;
 	}
 
-	int server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-	if (server_fd < 0) {
-		printk("[HTTP Server] Socket creation failed\n");
-		return;
-	}
+	int server_fd = -1;
+	int64_t last_reconnect_attempt = 0;
+	int64_t last_dhcp_log = 0;
 
-	int opt = 1;
-	setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-	struct sockaddr_in bind_addr = {
-		.sin_family = AF_INET,
-		.sin_port = htons(HTTP_PORT),
-		.sin_addr.s_addr = htonl(INADDR_ANY),
-	};
-
-	if (bind(server_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-		printk("[HTTP Server] Bind failed on port %d\n", HTTP_PORT);
-		close(server_fd);
-		return;
-	}
-
-	listen(server_fd, 5);
-	printk("[HTTP Server] Listening on port %d...\n", HTTP_PORT);
+	/* Trigger initial connection attempt */
+	trigger_wifi_connect();
+	last_reconnect_attempt = k_uptime_get();
 
 	while (1) {
+		int64_t now = k_uptime_get();
+
+		/* Auto-reconnect supervisor: retry every 10 seconds if disconnected */
+		if (!wifi_connected && (now - last_reconnect_attempt > 10000)) {
+			last_reconnect_attempt = now;
+			trigger_wifi_connect();
+		}
+
+		/* If associated but waiting for DHCP IPv4 address */
+		if (!wifi_has_ip) {
+			if (wifi_connected && (now - last_dhcp_log > 5000)) {
+				last_dhcp_log = now;
+#if defined(CONFIG_APP_WIFI_SSID)
+				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease...\n",
+				       CONFIG_APP_WIFI_SSID);
+#endif
+			}
+			/* Clean up sockets if disconnected */
+			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
+				if (sse_clients[i].fd >= 0) {
+					close(sse_clients[i].fd);
+					sse_clients[i].fd = -1;
+				}
+			}
+			if (server_fd >= 0) {
+				close(server_fd);
+				server_fd = -1;
+			}
+			k_sleep(K_MSEC(250));
+			continue;
+		}
+
+		/* Initialize listening server socket once IP is acquired */
+		if (server_fd < 0) {
+			server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+			if (server_fd < 0) {
+				printk("[HTTP Server] Socket creation failed\n");
+				k_sleep(K_MSEC(1000));
+				continue;
+			}
+
+			int opt = 1;
+			setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+			struct sockaddr_in bind_addr = {
+				.sin_family = AF_INET,
+				.sin_port = htons(HTTP_PORT),
+				.sin_addr.s_addr = htonl(INADDR_ANY),
+			};
+
+			if (bind(server_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+				printk("[HTTP Server] Bind failed on port %d, retrying in 1s...\n", HTTP_PORT);
+				close(server_fd);
+				server_fd = -1;
+				k_sleep(K_MSEC(1000));
+				continue;
+			}
+
+			listen(server_fd, 5);
+			printk("[HTTP Server] Listening on http://%s:%d/\n", wifi_ip_addr, HTTP_PORT);
+		}
+
 		struct zsock_pollfd pfd[1 + MAX_SSE_CLIENTS];
 		int pfd_to_client[MAX_SSE_CLIENTS];
 		int num_fds = 0;
@@ -1400,93 +1698,6 @@ static void ntp_sync_thread_fn(void *p1, void *p2, void *p3)
 }
 
 /* ========================================================================= */
-/* Wi-Fi Event Handler Callback                                              */
-/* ========================================================================= */
-static struct net_mgmt_event_callback wifi_mgmt_cb;
-static struct net_mgmt_event_callback ipv4_mgmt_cb;
-
-static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
-                                    uint64_t mgmt_event, struct net_if *iface)
-{
-	if (mgmt_event == NET_EVENT_WIFI_CONNECT_RESULT) {
-		const struct wifi_status *status = (const struct wifi_status *)cb->info;
-		if (status->status == 0) {
-			wifi_connected = true;
-			printk("[Wi-Fi] Connected to SSID. Requesting DHCPv4...\n");
-			net_dhcpv4_start(iface);
-		} else {
-			wifi_connected = false;
-			printk("[Wi-Fi] Connection failed (%d)\n", status->status);
-		}
-	} else if (mgmt_event == NET_EVENT_WIFI_DISCONNECT_RESULT) {
-		wifi_connected = false;
-		wifi_has_ip = false;
-		printk("[Wi-Fi] Disconnected\n");
-	}
-}
-
-static void ipv4_mgmt_event_handler(struct net_mgmt_event_callback *cb,
-                                    uint64_t mgmt_event, struct net_if *iface)
-{
-	if (mgmt_event == NET_EVENT_IPV4_ADDR_ADD) {
-		struct net_if_config *cfg = net_if_get_config(iface);
-		if (!cfg || !cfg->ip.ipv4) {
-			return;
-		}
-		for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
-			if (cfg->ip.ipv4->unicast[i].ipv4.addr_type == NET_ADDR_DHCP ||
-			    cfg->ip.ipv4->unicast[i].ipv4.is_used) {
-				char ip_str[INET_ADDRSTRLEN];
-				net_addr_ntop(AF_INET,
-				              &cfg->ip.ipv4->unicast[i].ipv4.address.in_addr,
-				              ip_str, sizeof(ip_str));
-				strncpy(wifi_ip_addr, ip_str, sizeof(wifi_ip_addr) - 1);
-				wifi_has_ip = true;
-				printk("=================================================================\n");
-				printk(">>> Wi-Fi Connected! IP: %s | Web Dashboard: http://%s/\n", ip_str, ip_str);
-				printk("=================================================================\n");
-				k_sem_give(&ntp_trigger_sem);
-				break;
-			}
-		}
-	}
-}
-
-static void wifi_connect_start(void)
-{
-	struct net_if *iface = net_if_get_default();
-	if (!iface) {
-		printk("[Wi-Fi] No default network interface!\n");
-		return;
-	}
-
-	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
-	net_mgmt_add_event_callback(&wifi_mgmt_cb);
-
-	net_mgmt_init_event_callback(&ipv4_mgmt_cb, ipv4_mgmt_event_handler,
-	                             NET_EVENT_IPV4_ADDR_ADD);
-	net_mgmt_add_event_callback(&ipv4_mgmt_cb);
-
-#if defined(CONFIG_APP_WIFI_SSID)
-	struct wifi_connect_req_params params = {
-		.ssid = (const uint8_t *)CONFIG_APP_WIFI_SSID,
-		.ssid_length = strlen(CONFIG_APP_WIFI_SSID),
-		.psk = (const uint8_t *)CONFIG_APP_WIFI_PSK,
-		.psk_length = strlen(CONFIG_APP_WIFI_PSK),
-		.channel = WIFI_CHANNEL_ANY,
-		.security = strlen(CONFIG_APP_WIFI_PSK) > 0 ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
-		.band = WIFI_FREQ_BAND_2_4_GHZ,
-		.mfp = WIFI_MFP_OPTIONAL,
-	};
-	printk("[Wi-Fi] Connecting to SSID: '%s'...\n", CONFIG_APP_WIFI_SSID);
-	net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
-#else
-	printk("[Wi-Fi] No SSID configured in Kconfig / credentials.conf!\n");
-#endif
-}
-
-/* ========================================================================= */
 /* Thread Definitions                                                        */
 /* ========================================================================= */
 K_THREAD_DEFINE(thread_motor_speed, STACK_MOTOR_SPEED, motor_speed_thread_fn,
@@ -1534,8 +1745,6 @@ int main(void)
 		counter_start(timer_dev);
 		printk("[MAIN] Periodic counter started at %d Hz\n", CONFIG_APP_SAMPLE_RATE_HZ);
 	}
-
-	wifi_connect_start();
 
 	while (1) {
 		k_sleep(K_SECONDS(30));
