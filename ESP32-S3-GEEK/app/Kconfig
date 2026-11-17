@@ -21,7 +21,7 @@ menu "Sensor and Sampling Configuration"
 
 config APP_SAMPLE_RATE_HZ
 	int "Sensor Sampling Rate (Hz)"
-	default 10
+	default 3
 	range 1 10
 	help
 	  Target sampling and update frequency for sensor acquisition,
@@ -29,7 +29,7 @@ config APP_SAMPLE_RATE_HZ
 
 config APP_MOTOR_PULSES_PER_REV
 	int "Motor FG Pulses Per Revolution"
-	default 2
+	default 6
 	help
 	  Number of FG pulses generated per complete motor shaft revolution.
 

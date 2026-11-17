@@ -2,32 +2,35 @@
  * Copyright (c) 2026
  * SPDX-License-Identifier: Apache-2.0
  *
- * Waveshare ESP32-S3-GEEK: Multi-Threaded Sensor Pipeline with FAT32 SDCard CSV Logger,
- * NTP Clock Synchronization, and Multi-Client SSE Web Dashboard.
+ * Waveshare ESP32-S3-GEEK PRO_CPU (Core 0): Primary Host Application.
  *
- * Architecture:
- *   [HW Timer ISR] -> signals sem -> [Thread 1: Speed Sampler (Priority 3)]
- *                                          │ (motor_speed_msgq)
+ * Multi-Core AMP Architecture (Sysbuild):
+ *   [APP_CPU (Core 1): Motor & Sensor Engine]
+ *               │ (IPM Channel 2: telemetry_packet_t)
+ *               │ (IPM Channel 3: ipc_print_packet_t)
+ *               ▼
+ *   [PRO_CPU (Core 0): IPM ISR / Callback]
+ *        ├── (ipc_print_msgq) ──> [Thread 0: Core 1 IPC Print Console (Priority 6)]
+ *        ├── (csv_msgq)       ──> [Thread 1: FAT32 SDCard CSV Logger (Priority 7)]
+ *        └── (spinlock)       ──> [Thread 2: Wi-Fi / SSE Web Server (Priority 8)]
+ *                                          │ (signals on IP acquired)
  *                                          ▼
- *                                     [Thread 2: Sensor Aggregator (Priority 5)]
- *                                     ├── (csv_msgq)       -> [Thread 3: SDCard CSV Logger (Priority 7)]
- *                                     └── (condvar/mutex)  -> [Thread 4: Wi-Fi/NTP/SSE Server (Priority 8)]
+ *                                   [Thread 3: Background NTP Client (Priority 10)]
  *
  * Features:
- *   1. FAT32 SD Card Support with auto-format on startup if unformatted.
- *   2. Daily auto-rotating CSV file logging: /SD:/telemetry_YYYY-MM-DD.csv
- *   3. NTP client synchronization for absolute wall-clock timestamps in CSV & Web UI.
- *   4. Multi-client SSE server (/events) streaming up to 1-hour historical data from CSV on connect,
+ *   1. Inter-Processor Mailbox (IPM) zero-jitter telemetry ingestion from Core 1.
+ *   2. FAT32 SD Card Support with auto-format on startup if unformatted.
+ *   3. Daily auto-rotating CSV file logging: /SD:/telemetry_YYYY-MM-DD.csv
+ *   4. NTP client synchronization for absolute wall-clock timestamps in CSV & Web UI.
+ *   5. Multi-client SSE server (/events) streaming up to 1-hour historical data from CSV on connect,
  *      followed by real-time sensor updates.
- *   5. Zero-dependency Canvas Dashboard with interactive hover tooltip & crosshair inspect.
+ *   6. Zero-dependency Canvas Dashboard with interactive hover tooltip & crosshair inspect.
  */
 
 #include <zephyr/kernel.h>
 #include <zephyr/device.h>
-#include <zephyr/drivers/counter.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/pwm.h>
-#include <zephyr/drivers/sensor.h>
+#include <zephyr/drivers/ipm.h>
 #include <zephyr/sys/printk.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -41,9 +44,12 @@
 #include <zephyr/net/net_core.h>
 #include <zephyr/net/net_context.h>
 #include <zephyr/net/net_mgmt.h>
+#include <zephyr/net/wifi.h>
 #include <zephyr/net/wifi_mgmt.h>
 #include <zephyr/net/socket.h>
 #include <zephyr/net/sntp.h>
+
+#include "telemetry.h"
 
 /* POSIX socket aliases */
 #define socket(f, t, p)             zsock_socket(f, t, p)
@@ -62,67 +68,58 @@
 #define HTTP_PORT                   80
 #define MAX_SSE_CLIENTS             4
 
+#ifndef MAX_CSV_FILES_RETAINED
+#define MAX_CSV_FILES_RETAINED      7     /* Keep up to 7 daily logs, prune oldest */
+#endif
+
 #ifndef CONFIG_APP_SAMPLE_RATE_HZ
-#define CONFIG_APP_SAMPLE_RATE_HZ   10
+#define CONFIG_APP_SAMPLE_RATE_HZ   3     /* 3 Hz sampling & streaming */
 #endif
 
-#ifndef CONFIG_APP_MOTOR_PULSES_PER_REV
-#define CONFIG_APP_MOTOR_PULSES_PER_REV 2
-#endif
+#define MAX_HIST_REPLAY_SAMPLES     15    /* Fast preload of last 15 samples (~5s) for instant startup */
 
-#define TIMER_INTERVAL_US           (1000000 / CONFIG_APP_SAMPLE_RATE_HZ)
-#define MAX_HIST_REPLAY_SAMPLES     (3600 * CONFIG_APP_SAMPLE_RATE_HZ)  /* 1 hour history */
+#define PRIORITY_IPC_CONSOLE        6     /* Thread 0: Core 1 IPC Print Console */
+#define PRIORITY_LOW                7     /* Thread 1: SD Card CSV Logger */
+#define PRIORITY_WIFI               8     /* Thread 2: Wi-Fi & Web Server */
+#define PRIORITY_DOWNLOAD           9     /* Thread 4: Background CSV Downloader */
+#define PRIORITY_NTP                10    /* Thread 3: Background NTP Client */
 
-#define PRIORITY_HIGH               3     /* Thread 1: Motor Speed Sampler (FG Counter) */
-#define PRIORITY_MEDIUM             5     /* Thread 2: Sensor Aggregator (I2C/INA219)   */
-#define PRIORITY_LOW                7     /* Thread 3: SD Card CSV Logger               */
-#define PRIORITY_WIFI               8     /* Thread 4: Wi-Fi & Web Server               */
-#define PRIORITY_NTP                10    /* Thread 5: Background NTP Client            */
-
-#define THREAD_STACK_SIZE           2048
-#define CSV_STACK_SIZE              4096
+#define IPC_CONSOLE_STACK_SIZE      2048
+#define CSV_STACK_SIZE              8192
 #define WIFI_STACK_SIZE             6144
+#define DOWNLOAD_STACK_SIZE         4096
 #define NTP_STACK_SIZE              3072
 
-#define TIMER_NODE                  DT_ALIAS(app_timer)
+/* Devicetree IPM node */
+static const struct device *ipm_dev;
 
-BUILD_ASSERT(DT_NODE_HAS_STATUS_OKAY(TIMER_NODE),
-             "Devicetree error: 'app-timer' alias is missing or disabled!");
-
-/* Hardware Devicetree Specs for Sensor Acquisition */
-static const struct gpio_dt_spec fg_spec = GPIO_DT_SPEC_GET_OR(DT_ALIAS(fg_pin), gpios, {0});
-static const struct pwm_dt_spec pwm_motor = PWM_DT_SPEC_GET_OR(DT_ALIAS(motor_pwm), {0});
-static const struct device *const ina219_dev = DEVICE_DT_GET_OR_NULL(DT_NODELABEL(ina219));
-
-static volatile uint32_t g_fg_pulse_counter = 0;
-static struct gpio_callback fg_gpio_cb;
-
-static void fg_gpio_isr(const struct device *port, struct gpio_callback *cb, gpio_port_pins_t pins)
-{
-	ARG_UNUSED(port);
-	ARG_UNUSED(cb);
-	ARG_UNUSED(pins);
-	g_fg_pulse_counter++;
-}
-
-/* ========================================================================= */
-/* Data Structures & Shared State                                            */
-/* ========================================================================= */
-typedef struct {
-	uint32_t pulse_count;
-	uint32_t rpm;
-	int64_t  timestamp_ms;
-} motor_speed_sample_t;
-
+/* Full telemetry record with wall-clock time added by PRO_CPU */
 typedef struct {
 	uint32_t sample_id;
 	uint32_t motor_rpm;
-	int32_t  temp_mc;      /* milli-Celsius (e.g. 42100 = 42.1 C) */
-	uint32_t bus_mv;       /* milli-Volts (e.g. 12050 = 12.05 V)  */
-	uint32_t current_ma;   /* milli-Amps (e.g. 840 = 840 mA)      */
+	int32_t  temp_mc;              /* milli-Celsius (e.g. 42100 = 42.1 C) */
+	uint32_t bus_mv;               /* milli-Volts (e.g. 12050 = 12.05 V)  */
+	int32_t  current_ma;           /* milli-Amps (signed, e.g. -85 .. 250 mA) */
 	int64_t  uptime_ms;
-	char     iso_time[32]; /* "YYYY-MM-DDTHH:MM:SSZ"              */
-} telemetry_packet_t;
+	uint8_t  pwm_pct;
+	uint8_t  profile_stage;
+	uint16_t profile_elapsed_sec;
+	uint16_t profile_total_sec;
+	char     iso_time[32];         /* "YYYY-MM-DDTHH:MM:SSZ"              */
+	char     date_str[16];         /* "YYYY-MM-DD"                        */
+} telemetry_full_t;
+
+/* Active 4-stage PWM Profile Configuration */
+static ipm_pwm_ctrl_t g_active_profile_cfg = {
+	.t_low_sec = DEFAULT_PROF_T_LOW,
+	.t_up_sec = DEFAULT_PROF_T_UP,
+	.t_high_sec = DEFAULT_PROF_T_HIGH,
+	.t_drop_sec = DEFAULT_PROF_T_DROP,
+	.p_low_pct = DEFAULT_PROF_P_LOW,
+	.p_high_pct = DEFAULT_PROF_P_HIGH,
+	.action = PWM_ACTION_START_PROFILE,
+	.manual_pwm = 0,
+};
 
 typedef struct {
 	int fd;
@@ -130,14 +127,12 @@ typedef struct {
 } sse_client_t;
 
 /* Message Queues */
-K_MSGQ_DEFINE(motor_speed_msgq, sizeof(motor_speed_sample_t), 4, 4);
-K_MSGQ_DEFINE(csv_msgq, sizeof(telemetry_packet_t), 8, 4);
+K_MSGQ_DEFINE(csv_msgq, sizeof(telemetry_full_t), 8, 4);
+K_MSGQ_DEFINE(ipc_print_msgq, sizeof(ipc_print_packet_t), 16, 4);
 
-/* Semaphores & Synchronization */
-static K_SEM_DEFINE(timer_tick_sem, 0, 1);
-static K_MUTEX_DEFINE(telemetry_mutex);
-static K_CONDVAR_DEFINE(telemetry_cv);
-static telemetry_packet_t latest_telemetry;
+/* Synchronization between IPM and SSE server */
+static struct k_spinlock telemetry_spinlock;
+static telemetry_full_t latest_telemetry;
 static bool has_telemetry = false;
 
 /* Active CSV Path shared between logger & SSE replay */
@@ -145,7 +140,7 @@ static K_MUTEX_DEFINE(csv_path_mutex);
 static char active_csv_filename[64] = "";
 
 /* Real-Time Clock / NTP State */
-static K_MUTEX_DEFINE(time_mutex);
+static struct k_spinlock time_spinlock;
 static int64_t ntp_epoch_sec = 0;
 static int64_t ntp_sync_uptime = 0;
 static bool ntp_synced = false;
@@ -154,10 +149,12 @@ static K_SEM_DEFINE(ntp_trigger_sem, 0, 1);
 /* Wi-Fi & Network State */
 static volatile bool wifi_connected = false;
 static volatile bool wifi_has_ip = false;
+static char assigned_ipv4_str[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+static uint32_t wifi_attempt_count = 0;
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
 
-/* FatFS File System mount descriptor */
+/* FatFS File System mount descriptor & Global File Mutex */
 static FATFS fat_fs;
 static struct fs_mount_t fs_mnt = {
 	.type = FS_FATFS,
@@ -165,31 +162,39 @@ static struct fs_mount_t fs_mnt = {
 	.mnt_point = "/SD:",
 };
 static bool sdcard_mounted = false;
+static K_MUTEX_DEFINE(sdcard_fs_mutex);
+static struct fs_file_t g_csv_file;
+static bool g_csv_file_is_open = false;
 
-/* PRNG helper for simulated sensor readings */
-static uint32_t prng_state = 123456789;
-static uint32_t prng_range(uint32_t min, uint32_t max)
+static void sdcard_flush_sync(void)
 {
-	prng_state = prng_state * 1664525 + 1013904223;
-	return min + (prng_state % (max - min + 1));
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	if (g_csv_file_is_open) {
+		fs_sync(&g_csv_file);
+	}
+	k_mutex_unlock(&sdcard_fs_mutex);
 }
 
 /* ========================================================================= */
-/* NTP & Time Formatting Helpers                                             */
+/* NTP & Time Formatting Helpers (UTC+8 Default)                             */
 /* ========================================================================= */
+#ifndef CONFIG_APP_TIMEZONE_OFFSET_SEC
+#define CONFIG_APP_TIMEZONE_OFFSET_SEC  (8 * 3600)  /* UTC+8 (28,800 seconds) */
+#endif
+
 static void get_formatted_time(char *iso_buf, size_t iso_len, char *date_buf, size_t date_len)
 {
 	int64_t now_sec;
-	k_mutex_lock(&time_mutex, K_FOREVER);
+	k_spinlock_key_t key = k_spin_lock(&time_spinlock);
 	if (ntp_synced) {
 		now_sec = ntp_epoch_sec + (k_uptime_get() - ntp_sync_uptime) / 1000;
 	} else {
 		/* Fallback starting at 2026-01-01 00:00:00 UTC before NTP sync */
 		now_sec = 1767225600LL + (k_uptime_get() / 1000);
 	}
-	k_mutex_unlock(&time_mutex);
+	k_spin_unlock(&time_spinlock, key);
 
-	time_t t = (time_t)now_sec;
+	time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
 	struct tm tm_info;
 	gmtime_r(&t, &tm_info);
 
@@ -200,14 +205,62 @@ static void get_formatted_time(char *iso_buf, size_t iso_len, char *date_buf, si
 	int min = (int)(tm_info.tm_min % 60);
 	int sec = (int)(tm_info.tm_sec % 60);
 
-	if (iso_buf && iso_len >= 21) {
-		snprintf(iso_buf, iso_len, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+	if (iso_buf && iso_len >= 26) {
+		snprintf(iso_buf, iso_len, "%04d-%02d-%02dT%02d:%02d:%02d+08:00",
 		         year, mon, day, hour, min, sec);
 	}
 	if (date_buf && date_len >= 11) {
 		snprintf(date_buf, date_len, "%04d-%02d-%02d",
 		         year, mon, day);
 	}
+}
+
+static void sync_time_to_app_cpu(int64_t now_ms, bool force)
+{
+	static int64_t last_sync_ms = 0;
+	if (!force && (now_ms - last_sync_ms < 250)) {
+		return;
+	}
+	last_sync_ms = now_ms;
+
+	if (!ipm_dev || !device_is_ready(ipm_dev)) {
+		return;
+	}
+
+	int64_t now_sec;
+	int64_t ms_from_sync = 0;
+	k_spinlock_key_t key = k_spin_lock(&time_spinlock);
+	if (ntp_synced) {
+		ms_from_sync = now_ms - ntp_sync_uptime;
+		now_sec = ntp_epoch_sec + (ms_from_sync / 1000);
+	} else {
+		ms_from_sync = now_ms;
+		now_sec = 1767225600LL + (now_ms / 1000);
+	}
+	bool is_synced = ntp_synced;
+	k_spin_unlock(&time_spinlock, key);
+
+	time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
+	struct tm tm_val;
+	gmtime_r(&t, &tm_val);
+
+	uint32_t sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
+	                      (uint32_t)tm_val.tm_min * 60U +
+	                      (uint32_t)tm_val.tm_sec;
+	uint16_t ms_part = (uint16_t)(((ms_from_sync % 1000LL) + 1000LL) % 1000LL);
+
+	ipm_time_sync_t t_sync = {
+		.month = (uint8_t)(tm_val.tm_mon + 1),
+		.day = (uint8_t)tm_val.tm_mday,
+		.hour = (uint8_t)tm_val.tm_hour,
+		.min = (uint8_t)tm_val.tm_min,
+		.sec = (uint8_t)tm_val.tm_sec,
+		.synced = is_synced ? 1 : 0,
+		.ms_part = ms_part,
+		.sec_of_day = sec_of_day,
+	};
+
+	ipm_send(ipm_dev, 0, IPM_CHANNEL_TIME_SYNC, &t_sync, sizeof(t_sync));
 }
 
 /* Helper to reliably send all bytes across a TCP socket */
@@ -226,11 +279,55 @@ static int send_all(int sock, const void *buf, size_t len)
 }
 
 /* ========================================================================= */
+/* Inter-Processor Mailbox (IPM) Callback from APP_CPU                       */
+/* ========================================================================= */
+static void ipm_receive_callback(const struct device *dev, void *user_data,
+                                 uint32_t id, volatile void *data)
+{
+	ARG_UNUSED(dev);
+	ARG_UNUSED(user_data);
+
+	if (id == IPM_CHANNEL_APP_TELEMETRY && data != NULL) {
+		telemetry_packet_t raw_pkt;
+		memcpy(&raw_pkt, (const void *)data, sizeof(raw_pkt));
+
+		telemetry_full_t full_pkt;
+		full_pkt.sample_id = raw_pkt.sample_id;
+		full_pkt.motor_rpm = raw_pkt.motor_rpm;
+		full_pkt.temp_mc = raw_pkt.temp_mc;
+		full_pkt.bus_mv = raw_pkt.bus_mv;
+		full_pkt.current_ma = raw_pkt.current_ma;
+		full_pkt.uptime_ms = raw_pkt.uptime_ms;
+		full_pkt.pwm_pct = raw_pkt.pwm_pct;
+		full_pkt.profile_stage = raw_pkt.profile_stage;
+		full_pkt.profile_elapsed_sec = raw_pkt.profile_elapsed_sec;
+		full_pkt.profile_total_sec = raw_pkt.profile_total_sec;
+
+		get_formatted_time(full_pkt.iso_time, sizeof(full_pkt.iso_time),
+		                   full_pkt.date_str, sizeof(full_pkt.date_str));
+
+		/* Enqueue to SD Card logger */
+		k_msgq_put(&csv_msgq, &full_pkt, K_NO_WAIT);
+
+		/* Update latest telemetry for SSE clients */
+		k_spinlock_key_t key = k_spin_lock(&telemetry_spinlock);
+		latest_telemetry = full_pkt;
+		has_telemetry = true;
+		k_spin_unlock(&telemetry_spinlock, key);
+	} else if (id == IPM_CHANNEL_APP_PRINT && data != NULL) {
+		ipc_print_packet_t print_pkt;
+		strncpy(print_pkt.msg, (const char *)data, sizeof(print_pkt.msg) - 1);
+		print_pkt.msg[sizeof(print_pkt.msg) - 1] = '\0';
+		k_msgq_put(&ipc_print_msgq, &print_pkt, K_NO_WAIT);
+	}
+}
+
+/* ========================================================================= */
 /* Embedded HTML5 / JS Dashboard with Interactive Hover Tooltip & Crosshairs */
 /* ========================================================================= */
 static const char HTTP_HTML_PAGE[] =
 "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-"<title>ESP32-S3-GEEK Live Telemetry</title>"
+"<title>ESP32-S3-GEEK Live Telemetry (AMP)</title>"
 "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
 "<style>"
 "body{font-family:system-ui,-apple-system,sans-serif;background:#121212;color:#e0e0e0;margin:0;padding:16px}"
@@ -249,323 +346,400 @@ static const char HTTP_HTML_PAGE[] =
 "#tip{position:fixed;display:none;background:#212121ee;border:1px solid #555;padding:8px 12px;border-radius:6px;font-size:0.75rem;pointer-events:none;z-index:999;box-shadow:0 4px 12px rgba(0,0,0,0.6)}"
 "</style></head><body>"
 "<h1>ESP32-S3-GEEK Telemetry Dashboard</h1>"
-"<div class=\"sub\">"
-"<span id=\"st\" class=\"badge\">Connecting SSE...</span>"
-"<span id=\"ntp\" class=\"badge\">NTP Syncing...</span>"
-"<span id=\"sd\" class=\"badge\">SD Card: Active</span>"
+"<div class=\"sub\">Zephyr RTOS &bull; Dual-Core AMP (PRO_CPU + APP_CPU) &bull; FatFS CSV Logger &bull; SSE Live Stream</div>"
+"<div style=\"margin-bottom:14px\">"
+"<span id=\"badge-wifi\" class=\"badge ok\">Wi-Fi: Connected</span>"
+"<span id=\"badge-sse\" class=\"badge\">SSE: 0 Clients</span>"
+"<span id=\"badge-ntp\" class=\"badge\">NTP: Syncing...</span>"
+"<span id=\"badge-sd\" class=\"badge ok\">SD: Logging</span>"
+"<span id=\"badge-amp\" class=\"badge ok\">AMP: IPM Active</span>"
+"<a href=\"/download\" download style=\"display:inline-block;padding:3px 10px;background:#0288d1;color:#fff;text-decoration:none;border-radius:4px;font-size:0.75rem;font-weight:600;margin-left:6px\">&#x1F4E5; Download CSV</a>"
 "</div>"
 "<div class=\"cards\">"
-"<div class=\"card\"><div class=\"label\">Motor Speed</div><div class=\"val\" id=\"vRpm\">-- RPM</div></div>"
-"<div class=\"card\"><div class=\"label\">Temperature</div><div class=\"val\" id=\"vTmp\">-- &deg;C</div></div>"
-"<div class=\"card\"><div class=\"label\">Bus Voltage</div><div class=\"val\" id=\"vVlt\">-- V</div></div>"
-"<div class=\"card\"><div class=\"label\">Current</div><div class=\"val\" id=\"vCur\">-- mA</div></div>"
+"<div class=\"card\"><div class=\"label\">Motor Speed</div><div class=\"val\"><span id=\"v-rpm\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">RPM</small></div></div>"
+"<div class=\"card\"><div class=\"label\">Active PWM</div><div class=\"val\"><span id=\"v-pwm\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">%</small></div></div>"
+"<div class=\"card\"><div class=\"label\">Profile Stage</div><div class=\"val\" id=\"v-stage\" style=\"color:#aaa\">Idle</div></div>"
+"<div class=\"card\"><div class=\"label\">Stage Progress</div><div class=\"val\"><span id=\"v-sec\">--</span> <small style=\"font-size:0.7rem;font-weight:400\" id=\"v-tot\">/ -- s</small></div></div>"
+"<div class=\"card\"><div class=\"label\">Temperature</div><div class=\"val\"><span id=\"v-temp\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">&deg;C</small></div></div>"
+"<div class=\"card\"><div class=\"label\">Bus Voltage</div><div class=\"val\"><span id=\"v-volt\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">V</small></div></div>"
+"<div class=\"card\"><div class=\"label\">Current</div><div class=\"val\"><span id=\"v-curr\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">mA</small></div></div>"
 "</div>"
-"<div class=\"box\"><div class=\"box-title\">Motor Speed (RPM) [Hover to Inspect]</div><canvas id=\"cRpm\"></canvas></div>"
-"<div class=\"box\"><div class=\"box-title\">Sensors (Temp &deg;C: Orange | Bus V: Green) [Hover to Inspect]</div><canvas id=\"cSens\"></canvas></div>"
+"<div class=\"box\">"
+"<div class=\"box-title\">Motor RPM History (0 &ndash; 5500 RPM Scale)</div>"
+"<canvas id=\"c-rpm\"></canvas>"
+"</div>"
+"<div class=\"box\">"
+"<div class=\"box-title\">Voltage & Current History</div>"
+"<canvas id=\"c-pwr\"></canvas>"
+"</div>"
+"<div class=\"box\">"
+"<div class=\"box-title\">4-Stage PWM Profile Curve (Low &rarr; Ramp Up &rarr; High &rarr; Drop)</div>"
+"<canvas id=\"c-curve\" style=\"height:130px;margin-bottom:10px\"></canvas>"
+"<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px\">"
+"<div><div class=\"label\">1. Low Time (s)</div><input id=\"t-low\" type=\"number\" min=\"0\" max=\"32768\" value=\"410\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Target Low PWM (%)</div><input id=\"p-low\" type=\"number\" min=\"0\" max=\"100\" value=\"0\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">2. Ramp Up Time (s)</div><input id=\"t-up\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">3. High Time (s)</div><input id=\"t-high\" type=\"number\" min=\"0\" max=\"32768\" value=\"170\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Target High PWM (%)</div><input id=\"p-high\" type=\"number\" min=\"0\" max=\"100\" value=\"90\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">4. Drop Time (s)</div><input id=\"t-drop\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"</div>"
+"<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\">"
+"<button id=\"btn-run\" onclick=\"startProfile()\" style=\"padding:6px 16px;background:#2e7d32;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer\">&#x25B6; Run Profile (Loop)</button>"
+"<button id=\"btn-stop\" onclick=\"stopProfile()\" style=\"padding:6px 16px;background:#c62828;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer\">&#x23F9; Stop (0%)</button>"
+"<span id=\"prof-status\" style=\"font-size:0.8rem;color:#81c784\">Status: Loop Active</span>"
+"</div>"
+"</div>"
 "<div id=\"tip\"></div>"
 "<script>"
-"const st=document.getElementById('st');"
-"const ntp=document.getElementById('ntp');"
+"const MAX_PTS=300;let pts=[];"
+"const cR=document.getElementById('c-rpm'),xR=cR.getContext('2d');"
+"const cP=document.getElementById('c-pwr'),xP=cP.getContext('2d');"
+"const cC=document.getElementById('c-curve'),xC=cC.getContext('2d');"
 "const tip=document.getElementById('tip');"
-"const rpmH=[],tmpH=[],vltH=[],curH=[],timeH=[];"
-"const maxPts=3600;"
-"let hIdx=-1,hCan=null;"
-"function draw(id,dsets,minY,maxY){"
-"const c=document.getElementById(id);const ctx=c.getContext('2d');"
-"const dpr=window.devicePixelRatio||1;const w=c.clientWidth,h=c.clientHeight;"
-"if(c.width!==w*dpr||c.height!==h*dpr){c.width=w*dpr;c.height=h*dpr}"
-"ctx.save();ctx.scale(dpr,dpr);ctx.clearRect(0,0,w,h);"
-"ctx.strokeStyle='#2a2a2a';ctx.lineWidth=1;"
-"for(let y=0;y<=h;y+=h/3){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}"
-"const n=dsets[0].data.length;"
-"if(n<2){ctx.restore();return;}"
-"const step=w/(n-1);"
-"dsets.forEach(ds=>{"
-"ctx.strokeStyle=ds.color;ctx.lineWidth=2;ctx.beginPath();"
-"ds.data.forEach((v,i)=>{"
-"const x=i*step;"
-"const y=h-(Math.max(minY,Math.min(maxY,v))-minY)/(maxY-minY)*(h-16)-8;"
-"if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});"
-"ctx.stroke();"
-"if(hIdx>=0&&hIdx<n){"
-"const hx=hIdx*step;"
-"const hy=h-(Math.max(minY,Math.min(maxY,ds.data[hIdx]))-minY)/(maxY-minY)*(h-16)-8;"
-"ctx.fillStyle=ds.color;ctx.beginPath();ctx.arc(hx,hy,4,0,Math.PI*2);ctx.fill();}"
-"});"
-"if(hIdx>=0&&hIdx<n){"
-"const hx=hIdx*step;"
-"ctx.strokeStyle='rgba(255,255,255,0.3)';ctx.setLineDash([4,4]);ctx.beginPath();"
-"ctx.moveTo(hx,0);ctx.lineTo(hx,h);ctx.stroke();}"
-"ctx.restore();}"
-"function updateCharts(){"
-"draw('cRpm',[{data:rpmH,color:'#4fc3f7'}],2000,4000);"
-"draw('cSens',[{data:tmpH,color:'#ff7043'},{data:vltH,color:'#81c784'}],10,60);}"
-"function hookHover(id){"
-"const c=document.getElementById(id);"
-"function handle(e){"
-"const rect=c.getBoundingClientRect();"
-"const cx=e.clientX||(e.touches&&e.touches[0].clientX);"
-"const cy=e.clientY||(e.touches&&e.touches[0].clientY);"
-"if(cx===undefined)return;"
-"const x=cx-rect.left;const n=rpmH.length;"
-"if(n<2)return;"
-"hIdx=Math.round((x/c.clientWidth)*(n-1));"
-"if(hIdx<0)hIdx=0;if(hIdx>=n)hIdx=n-1;"
-"hCan=id;updateCharts();"
+"let hoverIdx=-1;"
+"function resize(){cR.width=cR.clientWidth*window.devicePixelRatio||1;cR.height=cR.clientHeight*window.devicePixelRatio||1;cP.width=cP.clientWidth*window.devicePixelRatio||1;cP.height=cP.clientHeight*window.devicePixelRatio||1;cC.width=cC.clientWidth*window.devicePixelRatio||1;cC.height=cC.clientHeight*window.devicePixelRatio||1;render();drawCurve(-1);}"
+"window.addEventListener('resize',resize);"
+"function handleMove(e,c){"
+"const r=c.getBoundingClientRect();"
+"const x=(e.clientX-r.left)/r.width;"
+"if(pts.length>1){"
+"hoverIdx=Math.max(0,Math.min(pts.length-1,Math.round(x*(pts.length-1))));"
 "tip.style.display='block';"
-"tip.style.left=Math.min(window.innerWidth-180,Math.max(10,cx+12))+'px';"
-"tip.style.top=(cy-65)+'px';"
-"tip.innerHTML='<b>'+timeH[hIdx]+'</b><br>'+"
-"'<span style=\"color:#4fc3f7\">RPM: '+rpmH[hIdx]+'</span> | '+"
-"'<span style=\"color:#ff7043\">'+tmpH[hIdx].toFixed(1)+'&deg;C</span><br>'+"
-"'<span style=\"color:#81c784\">'+vltH[hIdx].toFixed(2)+'V</span> | '+"
-"'<span style=\"color:#ba68c8\">'+curH[hIdx]+'mA</span>';}"
-"c.addEventListener('mousemove',handle);"
-"c.addEventListener('touchmove',handle);"
-"function leave(){hIdx=-1;hCan=null;tip.style.display='none';updateCharts();}"
-"c.addEventListener('mouseleave',leave);"
-"c.addEventListener('touchend',leave);}"
-"hookHover('cRpm');hookHover('cSens');"
-"const es=new EventSource('/events');"
-"es.onopen=()=>{st.textContent='SSE Live Connected';st.className='badge ok';};"
-"es.onerror=()=>{st.textContent='SSE Reconnecting...';st.className='badge err';};"
-"es.onmessage=(e)=>{"
+"tip.style.left=(e.clientX+14)+'px';"
+"tip.style.top=(e.clientY+14)+'px';"
+"const p=pts[hoverIdx];"
+"tip.innerHTML='<b>'+(p.time||'Sample #'+p.id)+'</b><br>RPM: '+p.rpm+'<br>Temp: '+p.temp+' &deg;C<br>Bus: '+p.volt+' V<br>Current: '+p.curr+' mA';"
+"render();"
+"}}"
+"function handleLeave(){hoverIdx=-1;tip.style.display='none';render();}"
+"[cR,cP].forEach(c=>{"
+"c.addEventListener('mousemove',e=>handleMove(e,c));"
+"c.addEventListener('mouseleave',handleLeave);"
+"c.addEventListener('touchmove',e=>{if(e.touches.length>0)handleMove(e.touches[0],c);},{passive:true});"
+"c.addEventListener('touchend',handleLeave);"
+"});"
+"function drawGrid(ctx,w,h){ctx.strokeStyle='#262626';ctx.lineWidth=1;ctx.beginPath();for(let y=h*0.25;y<h;y+=h*0.25){ctx.moveTo(0,y);ctx.lineTo(w,y);}ctx.stroke();}"
+"function render(){"
+"const wR=cR.width,hR=cR.height,wP=cP.width,hP=cP.height;"
+"xR.clearRect(0,0,wR,hR);xP.clearRect(0,0,wP,hP);"
+"drawGrid(xR,wR,hR);drawGrid(xP,wP,hP);"
+"if(pts.length<2)return;"
+"let maxR=5500;pts.forEach(p=>{if(p.rpm>maxR)maxR=p.rpm;});"
+"xR.fillStyle='#666';xR.font=(9*window.devicePixelRatio)+'px sans-serif';"
+"xR.fillText(maxR+' RPM',6,12*window.devicePixelRatio);"
+"xR.fillText('0 RPM',6,hR-4);"
+"xR.strokeStyle='#4fc3f7';xR.lineWidth=2*window.devicePixelRatio;xR.beginPath();"
+"pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wR;const y=hR-(Math.min(p.rpm,maxR)/maxR)*hR;if(i===0)xR.moveTo(x,y);else xR.lineTo(x,y);});xR.stroke();"
+"let maxV=15,minI=0,maxI=250;pts.forEach(p=>{if(p.volt>maxV)maxV=p.volt;if(p.curr>maxI)maxI=p.curr;if(p.curr<minI)minI=p.curr;});"
+"const spanI=(maxI-minI)||1;"
+"xP.fillStyle='#81c784';xP.font=(9*window.devicePixelRatio)+'px sans-serif';xP.fillText(maxV+' V',6,12*window.devicePixelRatio);"
+"xP.fillStyle='#ffb74d';xP.fillText(maxI+' mA',wP-(55*window.devicePixelRatio),12*window.devicePixelRatio);"
+"if(minI<0){xP.fillText(minI+' mA',wP-(55*window.devicePixelRatio),hP-4);const y0=hP-((0-minI)/spanI)*hP;xP.strokeStyle='#ffb74d44';xP.lineWidth=1;xP.setLineDash([2,2]);xP.beginPath();xP.moveTo(0,y0);xP.lineTo(wP,y0);xP.stroke();xP.setLineDash([]);}"
+"xP.strokeStyle='#81c784';xP.lineWidth=2*window.devicePixelRatio;xP.beginPath();"
+"pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wP;const y=hP-(p.volt/maxV)*hP;if(i===0)xP.moveTo(x,y);else xP.lineTo(x,y);});xP.stroke();"
+"xP.strokeStyle='#ffb74d';xP.lineWidth=2*window.devicePixelRatio;xP.beginPath();"
+"pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wP;const y=hP-((p.curr-minI)/spanI)*hP;if(i===0)xP.moveTo(x,y);else xP.lineTo(x,y);});xP.stroke();"
+"if(hoverIdx>=0&&hoverIdx<pts.length){"
+"const xR_c=(hoverIdx/(pts.length-1))*wR;"
+"const xP_c=(hoverIdx/(pts.length-1))*wP;"
+"[xR,xP].forEach((ctx,idx)=>{const x=(idx===0)?xR_c:xP_c;const h=(idx===0)?hR:hP;"
+"ctx.strokeStyle='#ffffff66';ctx.lineWidth=1;ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();ctx.setLineDash([]);});"
+"}}"
+"const secIds=['t-low','t-up','t-high','t-drop'];"
+"const pwmIds=['p-low','p-high'];"
+"secIds.forEach(id=>{"
+"const el=document.getElementById(id);"
+"el.addEventListener('input',()=>{"
+"let v=parseInt(el.value);if(isNaN(v)||v<0)el.value=0;else if(v>32768)el.value=32768;"
+"drawCurve(-1);saveConfig();"
+"});});"
+"pwmIds.forEach(id=>{"
+"const el=document.getElementById(id);"
+"el.addEventListener('input',()=>{"
+"let v=parseInt(el.value);if(isNaN(v)||v<0)el.value=0;else if(v>100)el.value=100;"
+"drawCurve(-1);saveConfig();"
+"});});"
+"let saveTimer=null;"
+"function saveConfig(){"
+"if(saveTimer)clearTimeout(saveTimer);"
+"saveTimer=setTimeout(()=>{"
+"const t1=parseInt(document.getElementById('t-low').value)||0;"
+"const t2=parseInt(document.getElementById('t-up').value)||0;"
+"const t3=parseInt(document.getElementById('t-high').value)||0;"
+"const t4=parseInt(document.getElementById('t-drop').value)||0;"
+"const pL=parseInt(document.getElementById('p-low').value)||0;"
+"const pH=parseInt(document.getElementById('p-high').value)||0;"
+"fetch('/api/profile/config?t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4).catch(e=>{});"
+"},300);"
+"}"
+"function drawCurve(curSec){"
+"const w=cC.width,h=cC.height;"
+"xC.clearRect(0,0,w,h);drawGrid(xC,w,h);"
+"const t1=parseInt(document.getElementById('t-low').value)||0;"
+"const t2=parseInt(document.getElementById('t-up').value)||0;"
+"const t3=parseInt(document.getElementById('t-high').value)||0;"
+"const t4=parseInt(document.getElementById('t-drop').value)||0;"
+"const pL=parseInt(document.getElementById('p-low').value)||0;"
+"const pH=parseInt(document.getElementById('p-high').value)||0;"
+"const total=t1+t2+t3+t4;"
+"if(total<=0){xC.fillStyle='#666';xC.font='11px sans-serif';xC.fillText('Set durations > 0s to view curve',10,h/2);return;}"
+"const toX=s=>(s/total)*(w-50)+35;"
+"const toY=p=>h-16-(p/100)*(h-32);"
+"const x0=toX(0),x1=toX(t1),x2=toX(t1+t2),x3=toX(t1+t2+t3),x4=toX(total);"
+"const yL=toY(pL),yH=toY(pH);"
+"xC.strokeStyle='#ffffff22';xC.lineWidth=1;xC.setLineDash([3,3]);"
+"[x1,x2,x3].forEach(x=>{xC.beginPath();xC.moveTo(x,6);xC.lineTo(x,h-16);xC.stroke();});"
+"xC.setLineDash([]);"
+"xC.fillStyle='#888';xC.font=(10*window.devicePixelRatio)+'px sans-serif';"
+"if(t1>0)xC.fillText('Low ('+pL+'%)',x0+4,16);"
+"if(t2>0)xC.fillText('Ramp Up',x1+4,16);"
+"if(t3>0)xC.fillText('High ('+pH+'%)',x2+4,16);"
+"if(t4>0)xC.fillText('Drop',x3+4,16);"
+"xC.fillStyle='#555';xC.fillText('100%',4,toY(100)+4);xC.fillText('0%',12,toY(0)+4);"
+"const grad=xC.createLinearGradient(0,0,0,h);"
+"grad.addColorStop(0,'#00e5ff55');grad.addColorStop(1,'#00e5ff05');"
+"xC.fillStyle=grad;xC.beginPath();xC.moveTo(x0,toY(0));"
+"xC.lineTo(x0,yL);xC.lineTo(x1,yL);xC.lineTo(x2,yH);xC.lineTo(x3,yH);xC.lineTo(x4,yL);xC.lineTo(x4,toY(0));"
+"xC.closePath();xC.fill();"
+"xC.strokeStyle='#00e5ff';xC.lineWidth=2.5*window.devicePixelRatio;"
+"xC.beginPath();xC.moveTo(x0,yL);xC.lineTo(x1,yL);xC.lineTo(x2,yH);xC.lineTo(x3,yH);xC.lineTo(x4,yL);xC.stroke();"
+"if(curSec>=0&&curSec<=total){"
+"const cx=toX(curSec);"
+"let cp=pL;"
+"if(curSec<=t1)cp=pL;"
+"else if(curSec<=t1+t2)cp=pL+(pH-pL)*(t2>0?(curSec-t1)/t2:1);"
+"else if(curSec<=t1+t2+t3)cp=pH;"
+"else cp=pH-(pH-pL)*(t4>0?(curSec-t1-t2-t3)/t4:1);"
+"const cy=toY(cp);"
+"xC.strokeStyle='#ff5252';xC.lineWidth=1.5;xC.setLineDash([2,2]);"
+"xC.beginPath();xC.moveTo(cx,6);xC.lineTo(cx,h-16);xC.stroke();xC.setLineDash([]);"
+"xC.fillStyle='#ff5252';xC.beginPath();xC.arc(cx,cy,5*window.devicePixelRatio,0,Math.PI*2);xC.fill();"
+"xC.fillStyle='#fff';xC.fillText(Math.round(cp)+'% ('+curSec+'s)',cx+6,cy-4);"
+"}}"
+"function startProfile(){"
+"const t1=parseInt(document.getElementById('t-low').value)||0;"
+"const t2=parseInt(document.getElementById('t-up').value)||0;"
+"const t3=parseInt(document.getElementById('t-high').value)||0;"
+"const t4=parseInt(document.getElementById('t-drop').value)||0;"
+"const pL=parseInt(document.getElementById('p-low').value)||0;"
+"const pH=parseInt(document.getElementById('p-high').value)||0;"
+"const total=t1+t2+t3+t4;"
+"if(total<=0){alert('Total profile duration must be > 0s');return;}"
+"document.getElementById('prof-status').innerText='Starting backend profile...';"
+"fetch('/api/profile/start?t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4)"
+".then(r=>r.json()).then(j=>{"
+"document.getElementById('prof-status').innerHTML='<b>Backend Profile (Loop) Running</b>';"
+"}).catch(e=>{document.getElementById('prof-status').innerText='Communication error';});"
+"}"
+"function stopProfile(){"
+"document.getElementById('prof-status').innerText='Stopping profile...';"
+"fetch('/api/profile/stop')"
+".then(r=>r.json()).then(j=>{"
+"document.getElementById('prof-status').innerText='Status: Stopped (0% PWM)';"
+"drawCurve(-1);"
+"}).catch(e=>{document.getElementById('prof-status').innerText='Error stopping';});"
+"}"
+"resize();"
+"fetch('/api/profile/config').then(r=>r.json()).then(cfg=>{"
+"if(cfg.t_low!==undefined){"
+"document.getElementById('t-low').value=cfg.t_low;"
+"document.getElementById('p-low').value=cfg.p_low;"
+"document.getElementById('t-up').value=cfg.t_up;"
+"document.getElementById('t-high').value=cfg.t_high;"
+"document.getElementById('p-high').value=cfg.p_high;"
+"document.getElementById('t-drop').value=cfg.t_drop;"
+"drawCurve(-1);"
+"}"
+"}).catch(e=>{});"
+"fetch('/api/profile/status').then(r=>r.json()).then(st=>{"
+"if(st.running)drawCurve(st.elapsed_sec);"
+"}).catch(e=>{});"
+"const evt=new EventSource('/events');"
+"evt.onmessage=e=>{"
 "try{"
 "const d=JSON.parse(e.data);"
-"if(d.type==='hist_done'){updateCharts();return;}"
-"if(d.clients){st.textContent='SSE Live ('+d.clients+' client'+(d.clients>1?'s':'')+')';st.className='badge ok';}"
-"if(d.ntp){ntp.textContent='NTP: Synced';ntp.className='badge ok';}"
-"document.getElementById('vRpm').textContent=d.rpm+' RPM';"
-"document.getElementById('vTmp').textContent=d.temp.toFixed(1)+' \u00b0C';"
-"document.getElementById('vVlt').textContent=d.volt.toFixed(2)+' V';"
-"document.getElementById('vCur').textContent=d.curr+' mA';"
-"rpmH.push(d.rpm);if(rpmH.length>maxPts)rpmH.shift();"
-"tmpH.push(d.temp);if(tmpH.length>maxPts)tmpH.shift();"
-"vltH.push(d.volt);if(vltH.length>maxPts)vltH.shift();"
-"curH.push(d.curr);if(curH.length>maxPts)curH.shift();"
-"timeH.push(d.time||'');if(timeH.length>maxPts)timeH.shift();"
-"if(!d.hist||rpmH.length%50===0){updateCharts();}"
-"}catch(err){console.error(err);}};"
-"window.addEventListener('resize',updateCharts);"
+"if(d.type==='hist_done'){render();return;}"
+"pts.push(d);"
+"if(pts.length>MAX_PTS)pts.shift();"
+"document.getElementById('v-rpm').innerText=d.rpm;"
+"document.getElementById('v-temp').innerText=d.temp;"
+"document.getElementById('v-volt').innerText=d.volt;"
+"document.getElementById('v-curr').innerText=d.curr;"
+"if(d.pwm!==undefined)document.getElementById('v-pwm').innerText=d.pwm;"
+"if(d.stage!==undefined){"
+"const stNames=['Idle','Low Stage','Ramp Up','High Stage','Drop'];"
+"const stColors=['#aaa','#4fc3f7','#ffb74d','#81c784','#e57373'];"
+"const sName=stNames[d.stage]||('Stage '+d.stage);"
+"const elS=document.getElementById('v-stage');"
+"elS.innerText=sName;elS.style.color=stColors[d.stage]||'#fff';"
+"if(d.stage>0){"
+"document.getElementById('v-sec').innerText=(d.prof_sec||0)+'s';"
+"document.getElementById('v-tot').innerText='/ '+(d.prof_tot||0)+' s';"
+"document.getElementById('prof-status').innerHTML='<b style=\"color:'+(stColors[d.stage]||'#81c784')+'\">Loop Active &bull; '+sName+' ('+d.pwm+'% PWM) &bull; '+(d.prof_sec||0)+'s / '+(d.prof_tot||0)+'s</b>';"
+"drawCurve(d.prof_sec);"
+"}else{"
+"document.getElementById('v-sec').innerText='--';"
+"document.getElementById('v-tot').innerText='/ -- s';"
+"document.getElementById('prof-status').innerText='Status: Idle ('+d.pwm+'% PWM)';"
+"drawCurve(-1);"
+"}"
+"}"
+"if(d.clients!==undefined)document.getElementById('badge-sse').innerText='SSE: '+d.clients+' Client'+(d.clients===1?'':'s');"
+"if(d.ntp!==undefined){const nb=document.getElementById('badge-ntp');if(d.ntp){nb.className='badge ok';nb.innerText='NTP: Synced';}else{nb.className='badge';nb.innerText='NTP: Syncing...';}}"
+"if(!d.hist)render();"
+"}catch(err){}"
+"};"
+"evt.onerror=()=>{document.getElementById('badge-sse').className='badge err';document.getElementById('badge-sse').innerText='SSE: Reconnecting...';};"
+"evt.onopen=()=>{document.getElementById('badge-sse').className='badge ok';};"
 "</script></body></html>";
 
 /* ========================================================================= */
-/* Hardware Timer ISR Subroutine                                             */
-/* ========================================================================= */
-static void timer_top_subroutine(const struct device *dev, void *user_data)
-{
-	ARG_UNUSED(dev);
-	ARG_UNUSED(user_data);
-	k_sem_give(&timer_tick_sem);
-}
-
-/* ========================================================================= */
-/* Thread 1 (High Priority): Motor Speed Sampler (FG Counter & PWM Setup)    */
-/* ========================================================================= */
-static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	printk("[Thread 1: Speed Sampler] Started (Priority %d, Target Rate: %d Hz)\n",
-	       PRIORITY_HIGH, CONFIG_APP_SAMPLE_RATE_HZ);
-
-	/* Initialize Motor FG pulse input GPIO pin */
-	bool fg_ready = false;
-	if (fg_spec.port && gpio_is_ready_dt(&fg_spec)) {
-		if (gpio_pin_configure_dt(&fg_spec, GPIO_INPUT) == 0) {
-			gpio_init_callback(&fg_gpio_cb, fg_gpio_isr, BIT(fg_spec.pin));
-			if (gpio_add_callback(fg_spec.port, &fg_gpio_cb) == 0) {
-				if (gpio_pin_interrupt_configure_dt(&fg_spec, GPIO_INT_EDGE_FALLING) == 0) {
-					printk("[Thread 1] Configured FG GPIO interrupt on pin %d\n", fg_spec.pin);
-					fg_ready = true;
-				}
-			}
-		}
-	}
-
-	if (!fg_ready) {
-		printk("[Thread 1] FG pin not available, running in bench simulation mode\n");
-	}
-
-	/* Initialize Motor PWM output */
-	if (pwm_motor.dev && pwm_is_ready_dt(&pwm_motor)) {
-		/* Set default 50% duty cycle at 25 kHz */
-		pwm_set_pulse_dt(&pwm_motor, pwm_motor.period / 2);
-		printk("[Thread 1] Initialized Motor PWM on pin %d (25 kHz, 50%% duty cycle)\n", 7);
-	} else {
-		printk("[Thread 1] Motor PWM device not ready or disabled in overlay\n");
-	}
-
-	uint32_t last_pulses = 0;
-
-	while (1) {
-		k_sem_take(&timer_tick_sem, K_FOREVER);
-
-		motor_speed_sample_t sample;
-		sample.timestamp_ms = k_uptime_get();
-
-		if (fg_ready) {
-			uint32_t cur_pulses = g_fg_pulse_counter;
-			uint32_t delta = cur_pulses - last_pulses;
-			last_pulses = cur_pulses;
-			sample.pulse_count = delta;
-			sample.rpm = (delta * 60 * CONFIG_APP_SAMPLE_RATE_HZ) / CONFIG_APP_MOTOR_PULSES_PER_REV;
-		} else {
-			/* Bench simulation: ~3000 RPM nominal */
-			uint32_t nominal_pulses = (3000 * CONFIG_APP_MOTOR_PULSES_PER_REV) / (60 * CONFIG_APP_SAMPLE_RATE_HZ);
-			sample.pulse_count = prng_range(nominal_pulses > 2 ? nominal_pulses - 2 : 1, nominal_pulses + 2);
-			sample.rpm = (sample.pulse_count * 60 * CONFIG_APP_SAMPLE_RATE_HZ) / CONFIG_APP_MOTOR_PULSES_PER_REV;
-		}
-
-		k_msgq_put(&motor_speed_msgq, &sample, K_NO_WAIT);
-	}
-}
-
-/* ========================================================================= */
-/* Thread 2 (Medium Priority): Sensor Aggregator (INA219 I2C & Time Tagger)  */
-/* ========================================================================= */
-static void sensor_aggregator_thread_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	uint32_t sequence = 0;
-	motor_speed_sample_t speed_sample;
-
-	printk("[Thread 2: Aggregator] Started (Priority %d)\n", PRIORITY_MEDIUM);
-
-	if (ina219_dev && device_is_ready(ina219_dev)) {
-		printk("[Thread 2] INA219 I2C sensor ready on bus %s\n", ina219_dev->name);
-	} else {
-		printk("[Thread 2] INA219 not detected, running with simulated bus voltage & current\n");
-	}
-
-	while (1) {
-		k_msgq_get(&motor_speed_msgq, &speed_sample, K_FOREVER);
-		sequence++;
-
-		telemetry_packet_t packet;
-		packet.sample_id = sequence;
-		packet.motor_rpm = speed_sample.rpm;
-		packet.uptime_ms = speed_sample.timestamp_ms;
-
-		bool ina_ok = false;
-		if (ina219_dev && device_is_ready(ina219_dev)) {
-			if (sensor_sample_fetch(ina219_dev) == 0) {
-				struct sensor_value v_bus, i_curr;
-				sensor_channel_get(ina219_dev, SENSOR_CHAN_VOLTAGE, &v_bus);
-				sensor_channel_get(ina219_dev, SENSOR_CHAN_CURRENT, &i_curr);
-
-				packet.bus_mv = (uint32_t)(v_bus.val1 * 1000 + v_bus.val2 / 1000);
-				packet.current_ma = (uint32_t)(i_curr.val1 * 1000 + i_curr.val2 / 1000);
-				ina_ok = true;
-			}
-		}
-
-		if (!ina_ok) {
-			/* Simulation fallback */
-			packet.bus_mv     = prng_range(11850, 12150);
-			packet.current_ma = prng_range(780, 920);
-		}
-		packet.temp_mc    = (int32_t)prng_range(41200, 42800);
-
-		get_formatted_time(packet.iso_time, sizeof(packet.iso_time), NULL, 0);
-
-		/* Update snapshot for live SSE broadcasting */
-		k_mutex_lock(&telemetry_mutex, K_FOREVER);
-		latest_telemetry = packet;
-		has_telemetry = true;
-		k_condvar_broadcast(&telemetry_cv);
-		k_mutex_unlock(&telemetry_mutex);
-
-		/* Enqueue packet to Thread 3 for SD card CSV logging */
-		k_msgq_put(&csv_msgq, &packet, K_NO_WAIT);
-	}
-}
-
-/* ========================================================================= */
-/* Thread 3 (Low Priority): SD Card FAT32 CSV Logger & Daily Auto-Rotator    */
+/* FatFS SD Card Initialization with Auto-Mount Support                      */
 /* ========================================================================= */
 static int init_sdcard_fat32(void)
 {
+	if (sdcard_mounted) {
+		return 0;
+	}
+
 	int res = fs_mount(&fs_mnt);
-	if (res != 0) {
-		printk("[SD Card] Initial mount failed (err %d). Formatting as FAT32...\n", res);
-		res = fs_mkfs(FS_FATFS, (uintptr_t)"SD:", NULL, 0);
-		if (res != 0) {
-			printk("[SD Card] FAT32 format failed: %d\n", res);
-			return res;
+	if (res == 0) {
+		printk("[SD Card] FAT32 Volume mounted successfully at %s\n", fs_mnt.mnt_point);
+		sdcard_mounted = true;
+		return 0;
+	}
+
+	printk("[SD Card] Mount attempt failed at %s (err: %d). No SD card or unreadable.\n",
+	       fs_mnt.mnt_point, res);
+	sdcard_mounted = false;
+	return res;
+}
+
+static void prune_old_csv_files(void)
+{
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	struct fs_dir_t dirp;
+	fs_dir_t_init(&dirp);
+	int rc = fs_opendir(&dirp, "/SD:");
+	if (rc != 0) {
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return;
+	}
+
+	char names[32][32];
+	int count = 0;
+	struct fs_dirent entry;
+
+	while (fs_readdir(&dirp, &entry) == 0 && entry.name[0] != '\0') {
+		if (entry.type == FS_DIR_ENTRY_FILE &&
+		    strncmp(entry.name, "telemetry_", 10) == 0 &&
+		    strstr(entry.name, ".csv") != NULL) {
+			if (count < 32) {
+				strncpy(names[count], entry.name, sizeof(names[count]) - 1);
+				names[count][sizeof(names[count]) - 1] = '\0';
+				count++;
+			}
 		}
-		printk("[SD Card] Format complete! Mounting volume...\n");
-		res = fs_mount(&fs_mnt);
-		if (res != 0) {
-			printk("[SD Card] Re-mount failed after format: %d\n", res);
-			return res;
+	}
+	fs_closedir(&dirp);
+
+	if (count <= MAX_CSV_FILES_RETAINED) {
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return;
+	}
+
+	/* Sort ascending: oldest dates first (telemetry_YYYY-MM-DD.csv) */
+	for (int i = 0; i < count - 1; i++) {
+		for (int j = i + 1; j < count; j++) {
+			if (strcmp(names[i], names[j]) > 0) {
+				char temp[32];
+				memcpy(temp, names[i], sizeof(temp));
+				memcpy(names[i], names[j], sizeof(temp));
+				memcpy(names[j], temp, sizeof(temp));
+			}
 		}
 	}
 
-	printk("[SD Card] FAT32 Volume mounted successfully at %s\n", fs_mnt.mnt_point);
-	sdcard_mounted = true;
-	return 0;
+	int files_to_delete = count - MAX_CSV_FILES_RETAINED;
+	for (int i = 0; i < files_to_delete; i++) {
+		char del_path[64];
+		snprintf(del_path, sizeof(del_path), "/SD:/%s", names[i]);
+		int del_rc = fs_unlink(del_path);
+		printk("[SD Card] Rotation limit (%d files) reached: pruned oldest CSV '%s' (rc: %d)\n",
+		       MAX_CSV_FILES_RETAINED, del_path, del_rc);
+	}
+	k_mutex_unlock(&sdcard_fs_mutex);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Thread 1: SD Card FAT32 CSV Logger                                        */
+/* ------------------------------------------------------------------------- */
 static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	printk("[Thread 3: SD CSV Logger] Started (Priority %d)\n", PRIORITY_LOW);
+	printk("[Thread 1: SD CSV Logger] Started (Priority %d)\n", PRIORITY_LOW);
 
-	/* Initialize SD card and format as FAT32 if necessary */
 	init_sdcard_fat32();
 
 	char current_day_str[24] = "";
-	struct fs_file_t csv_file;
-	fs_file_t_init(&csv_file);
-	bool file_is_open = false;
+	fs_file_t_init(&g_csv_file);
+	int64_t last_mount_attempt = k_uptime_get();
 
 	while (1) {
-		telemetry_packet_t packet;
+		telemetry_full_t packet;
 		k_msgq_get(&csv_msgq, &packet, K_FOREVER);
 
 		if (!sdcard_mounted) {
-			/* Retry mounting if card wasn't available at boot */
-			if (init_sdcard_fat32() != 0) {
+			int64_t now = k_uptime_get();
+			if (now - last_mount_attempt > 10000) {
+				last_mount_attempt = now;
+				init_sdcard_fat32();
+			}
+			if (!sdcard_mounted) {
 				continue;
 			}
 		}
 
 		char day_str[24];
-		get_formatted_time(NULL, 0, day_str, sizeof(day_str));
+		if (strlen(packet.date_str) > 0) {
+			strncpy(day_str, packet.date_str, sizeof(day_str));
+		} else {
+			get_formatted_time(NULL, 0, day_str, sizeof(day_str));
+		}
 
 		/* Daily file rotation: If day changed or first run */
 		if (strcmp(day_str, current_day_str) != 0) {
-			if (file_is_open) {
-				fs_close(&csv_file);
-				file_is_open = false;
+			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+			if (g_csv_file_is_open) {
+				fs_close(&g_csv_file);
+				g_csv_file_is_open = false;
 			}
+			k_mutex_unlock(&sdcard_fs_mutex);
+
+			prune_old_csv_files();
 
 			strncpy(current_day_str, day_str, sizeof(current_day_str));
 			char filepath[64];
 			snprintf(filepath, sizeof(filepath), "/SD:/telemetry_%s.csv", current_day_str);
 
+			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 			struct fs_dirent entry;
 			bool exists = (fs_stat(filepath, &entry) == 0);
 
-			int res = fs_open(&csv_file, filepath, FS_O_CREATE | FS_O_WRITE | FS_O_APPEND);
+			int res = fs_open(&g_csv_file, filepath, FS_O_CREATE | FS_O_WRITE | FS_O_APPEND);
 			if (res == 0) {
-				file_is_open = true;
+				g_csv_file_is_open = true;
 
 				/* Write CSV header if creating a new file */
 				if (!exists || entry.size == 0) {
 					const char *hdr = "timestamp_iso,uptime_ms,sample_id,rpm,temp_c,bus_volt_v,curr_ma\n";
-					fs_write(&csv_file, hdr, strlen(hdr));
-					fs_sync(&csv_file);
+					fs_write(&g_csv_file, hdr, strlen(hdr));
+					fs_sync(&g_csv_file);
 				}
+				k_mutex_unlock(&sdcard_fs_mutex);
 
 				k_mutex_lock(&csv_path_mutex, K_FOREVER);
 				strncpy(active_csv_filename, filepath, sizeof(active_csv_filename));
@@ -573,14 +747,15 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 
 				printk("[SD Card] Opened/Rotated CSV log: %s\n", filepath);
 			} else {
+				k_mutex_unlock(&sdcard_fs_mutex);
 				printk("[SD Card] Failed to open CSV file %s (err %d)\n", filepath, res);
 			}
 		}
 
 		/* Append telemetry record */
-		if (file_is_open) {
+		if (g_csv_file_is_open) {
 			char line[128];
-			int len = snprintf(line, sizeof(line), "%s,%lld,%u,%u,%d.%d,%u.%02u,%u\n",
+			int len = snprintf(line, sizeof(line), "%s,%lld,%u,%u,%d.%d,%u.%02u,%d\n",
 			                   packet.iso_time,
 			                   packet.uptime_ms,
 			                   packet.sample_id,
@@ -590,11 +765,12 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			                   packet.current_ma);
 
 			if (len > 0) {
-				fs_write(&csv_file, line, len);
-				/* Flush to card periodically (~once per second) to preserve SD flash endurance */
+				k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+				fs_write(&g_csv_file, line, len);
 				if (packet.sample_id % CONFIG_APP_SAMPLE_RATE_HZ == 0) {
-					fs_sync(&csv_file);
+					fs_sync(&g_csv_file);
 				}
+				k_mutex_unlock(&sdcard_fs_mutex);
 			}
 		}
 	}
@@ -612,35 +788,37 @@ static void replay_csv_history_to_sse(int client_fd)
 	}
 	k_mutex_unlock(&csv_path_mutex);
 
-	if (strlen(filepath) == 0) {
+	if (strlen(filepath) == 0 || !sdcard_mounted) {
 		return;
 	}
 
+	/* Flush any pending writes so file size and data on disk are current */
+	sdcard_flush_sync();
+
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 	struct fs_dirent entry;
 	if (fs_stat(filepath, &entry) != 0 || entry.size == 0) {
+		k_mutex_unlock(&sdcard_fs_mutex);
 		return;
 	}
 
 	struct fs_file_t rf;
 	fs_file_t_init(&rf);
 	if (fs_open(&rf, filepath, FS_O_READ) != 0) {
+		k_mutex_unlock(&sdcard_fs_mutex);
 		return;
 	}
 
-	/* Max 1 hour at 1 Hz is ~3600 samples * ~60 bytes/sample = ~216 KB */
 	const off_t max_bytes = MAX_HIST_REPLAY_SAMPLES * 65;
 	if (entry.size > max_bytes) {
 		fs_seek(&rf, entry.size - max_bytes, FS_SEEK_SET);
-		/* Discard partial line until next newline */
 		char c;
 		while (fs_read(&rf, &c, 1) > 0 && c != '\n');
 	} else {
-		/* Skip CSV header */
 		char c;
 		while (fs_read(&rf, &c, 1) > 0 && c != '\n');
 	}
 
-	/* Read lines and pump historical SSE records */
 	char line_buf[128];
 	size_t idx = 0;
 	char ch;
@@ -650,22 +828,26 @@ static void replay_csv_history_to_sse(int client_fd)
 		if (ch == '\n' || ch == '\r') {
 			if (idx > 0) {
 				line_buf[idx] = '\0';
-				char t_iso[24];
+				char t_iso[32];
 				long long up;
-				unsigned int sid, rpm, curr;
+				unsigned int sid, rpm;
+				int curr;
 				int tc_int, tc_fr;
 				unsigned int v_int, v_fr;
 
-				if (sscanf(line_buf, "%23[^,],%lld,%u,%u,%d.%d,%u.%u,%u",
+				if (sscanf(line_buf, "%31[^,],%lld,%u,%u,%d.%d,%u.%u,%d",
 				           t_iso, &up, &sid, &rpm, &tc_int, &tc_fr, &v_int, &v_fr, &curr) >= 8) {
 					char sse_item[220];
 					int slen = snprintf(sse_item, sizeof(sse_item),
-					                    "data: {\"id\":%u,\"rpm\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%u,\"uptime\":%lld,\"time\":\"%s\",\"hist\":true}\n\n",
+					                    "data: {\"id\":%u,\"rpm\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"hist\":true}\n\n",
 					                    sid, rpm, tc_int, tc_fr, v_int, v_fr, curr, up, t_iso);
 					if (send_all(client_fd, sse_item, slen) < 0) {
 						break;
 					}
 					sent_count++;
+					if (sent_count >= MAX_HIST_REPLAY_SAMPLES) {
+						break;
+					}
 				}
 				idx = 0;
 			}
@@ -677,15 +859,125 @@ static void replay_csv_history_to_sse(int client_fd)
 	}
 
 	fs_close(&rf);
+	k_mutex_unlock(&sdcard_fs_mutex);
 
-	/* Signal history load complete */
 	const char *hist_done = "data: {\"type\":\"hist_done\"}\n\n";
 	send_all(client_fd, hist_done, strlen(hist_done));
 	printk("[HTTP] Replayed %d historical CSV records to SSE client\n", sent_count);
 }
 
+static K_SEM_DEFINE(download_start_sem, 0, 1);
+static volatile int g_download_client_fd = -1;
+static volatile bool g_download_in_progress = false;
+
+static void handle_http_csv_download(int client_fd)
+{
+	char filepath[64] = "";
+	k_mutex_lock(&csv_path_mutex, K_FOREVER);
+	strncpy(filepath, active_csv_filename, sizeof(filepath));
+	k_mutex_unlock(&csv_path_mutex);
+
+	if (strlen(filepath) == 0 || !sdcard_mounted) {
+		const char *not_found =
+			"HTTP/1.1 404 Not Found\r\n"
+			"Content-Type: text/plain\r\n"
+			"Connection: close\r\n\r\n"
+			"No active CSV file available on SD card.\r\n";
+		send_all(client_fd, not_found, strlen(not_found));
+		close(client_fd);
+		return;
+	}
+
+	/* Flush any pending writes so file size and contents are current */
+	sdcard_flush_sync();
+
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	struct fs_file_t rf;
+	fs_file_t_init(&rf);
+	int rc = fs_open(&rf, filepath, FS_O_READ);
+	k_mutex_unlock(&sdcard_fs_mutex);
+
+	if (rc != 0) {
+		printk("[HTTP Download] fs_open failed for '%s' (err %d)\n", filepath, rc);
+		const char *err_resp =
+			"HTTP/1.1 500 Internal Server Error\r\n"
+			"Content-Type: text/plain\r\n"
+			"Connection: close\r\n\r\n"
+			"Failed to open CSV file on SD card.\r\n";
+		send_all(client_fd, err_resp, strlen(err_resp));
+		close(client_fd);
+		return;
+	}
+
+	const char *basename = strrchr(filepath, '/');
+	if (basename) {
+		basename++;
+	} else {
+		basename = "telemetry.csv";
+	}
+
+	char header[256];
+	int hlen = snprintf(header, sizeof(header),
+	                    "HTTP/1.1 200 OK\r\n"
+	                    "Content-Type: text/csv\r\n"
+	                    "Content-Disposition: attachment; filename=\"%s\"\r\n"
+	                    "Connection: close\r\n\r\n",
+	                    basename);
+	if (send_all(client_fd, header, hlen) < 0) {
+		k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+		fs_close(&rf);
+		k_mutex_unlock(&sdcard_fs_mutex);
+		close(client_fd);
+		return;
+	}
+
+	char chunk[512];
+	while (1) {
+		k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+		ssize_t bytes_read = fs_read(&rf, chunk, sizeof(chunk));
+		k_mutex_unlock(&sdcard_fs_mutex);
+
+		if (bytes_read <= 0) {
+			break;
+		}
+
+		if (send_all(client_fd, chunk, (size_t)bytes_read) < 0) {
+			break;
+		}
+
+		/* Yield CPU so HTTP server, live SSE streaming, and SD logger remain responsive */
+		k_msleep(2);
+	}
+
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	fs_close(&rf);
+	k_mutex_unlock(&sdcard_fs_mutex);
+
+	close(client_fd);
+	printk("[HTTP] CSV file '%s' downloaded successfully\n", filepath);
+}
+
+static void csv_download_thread_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	printk("[Thread 4: Background CSV Downloader] Started (Priority %d)\n", PRIORITY_DOWNLOAD);
+
+	while (1) {
+		k_sem_take(&download_start_sem, K_FOREVER);
+		int fd = g_download_client_fd;
+		if (fd >= 0) {
+			handle_http_csv_download(fd);
+			g_download_client_fd = -1;
+		}
+		g_download_in_progress = false;
+	}
+}
+
 /* ========================================================================= */
-/* Thread 4 (Wi-Fi, Auto-Reconnect & HTTP/SSE Web Server)                    */
+/* Thread 2 (Wi-Fi, Auto-Reconnect & HTTP/SSE Web Server)                    */
 /* ========================================================================= */
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
                                     uint64_t mgmt_event, struct net_if *iface)
@@ -693,20 +985,53 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 	switch (mgmt_event) {
 	case NET_EVENT_WIFI_CONNECT_RESULT: {
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
+		if (!status) {
+			printk("[Wi-Fi] Event: CONNECT_RESULT (no status data)\n");
+			break;
+		}
 		if (status->status == 0) {
-			printk("[Wi-Fi] Connected to SSID: %s\n", CONFIG_APP_WIFI_SSID);
 			wifi_connected = true;
+			printk("\n============================================================\n");
+			printk("[Wi-Fi] Association SUCCESSFUL!\n");
+			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
+			printk("[Wi-Fi]   Status      : %s (code %d)\n",
+			       wifi_conn_status_txt(status->conn_status), status->status);
+			printk("[Wi-Fi]   Link State  : UP -> Requesting DHCP IPv4 address...\n");
+			printk("============================================================\n");
 		} else {
-			printk("[Wi-Fi] Connection attempt failed (status %d), will retry...\n", status->status);
 			wifi_connected = false;
 			wifi_has_ip = false;
+			assigned_ipv4_str[0] = '\0';
+			printk("\n============================================================\n");
+			printk("[Wi-Fi] Association FAILED!\n");
+			printk("[Wi-Fi]   SSID        : %s\n", CONFIG_APP_WIFI_SSID);
+			printk("[Wi-Fi]   Status      : %s (code %d)\n",
+			       wifi_conn_status_txt(status->conn_status), status->status);
+			if (status->status_code != 0 || status->reason_code != 0) {
+				printk("[Wi-Fi]   802.11 Code : Status=%u, Reason=%u\n",
+				       status->status_code, status->reason_code);
+			}
+			printk("[Wi-Fi]   Action      : Auto-reconnect will retry in 10s...\n");
+			printk("============================================================\n");
 		}
 		break;
 	}
 	case NET_EVENT_WIFI_DISCONNECT_RESULT: {
-		printk("[Wi-Fi] Disconnected from network! Auto-reconnect active...\n");
 		wifi_connected = false;
 		wifi_has_ip = false;
+		assigned_ipv4_str[0] = '\0';
+		const struct wifi_status *status = (const struct wifi_status *)cb->info;
+		printk("\n============================================================\n");
+		printk("[Wi-Fi] Disconnected from AP!\n");
+		if (status) {
+			printk("[Wi-Fi]   Reason      : %s (code %d)\n",
+			       wifi_disconn_reason_txt(status->disconn_reason), status->status);
+			if (status->reason_code != 0) {
+				printk("[Wi-Fi]   802.11 Reason: %u\n", status->reason_code);
+			}
+		}
+		printk("[Wi-Fi]   State       : Network down, auto-reconnect supervisor active...\n");
+		printk("============================================================\n");
 		break;
 	}
 	case NET_EVENT_IPV4_ADDR_ADD: {
@@ -714,17 +1039,35 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		if (!cfg || !cfg->ip.ipv4) {
 			break;
 		}
-		char buf[NET_IPV4_ADDR_LEN];
+		char ip_buf[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+		char nm_buf[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+		char gw_buf[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+
 		for (int i = 0; i < NET_IF_MAX_IPV4_ADDR; i++) {
 			if (cfg->ip.ipv4->unicast[i].ipv4.addr_type == NET_ADDR_DHCP ||
 			    cfg->ip.ipv4->unicast[i].ipv4.is_used) {
 				net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[i].ipv4.address.in_addr,
-				              buf, sizeof(buf));
-				printk("\n======================================================\n");
-				printk(">>> ESP32-S3-GEEK Web Dashboard is LIVE! <<<\n");
-				printk(">>> Open browser at: http://%s/ <<<\n", buf);
-				printk("======================================================\n\n");
+				              ip_buf, sizeof(ip_buf));
+				net_addr_ntop(AF_INET, &cfg->ip.ipv4->unicast[i].netmask,
+				              nm_buf, sizeof(nm_buf));
+				net_addr_ntop(AF_INET, &cfg->ip.ipv4->gw,
+				              gw_buf, sizeof(gw_buf));
+
+				snprintk(assigned_ipv4_str, sizeof(assigned_ipv4_str), "%s", ip_buf);
 				wifi_has_ip = true;
+
+				printk("\n============================================================\n");
+				printk(">>> ESP32-S3-GEEK Network Ready & Web Dashboard LIVE! <<<\n");
+				printk("============================================================\n");
+				printk("  [IP Address]   : %s\n", ip_buf);
+				printk("  [Subnet Mask]  : %s\n", nm_buf);
+				printk("  [Gateway]      : %s\n", gw_buf);
+				printk("  [Web URL]      : http://%s/\n", ip_buf);
+				printk("  [SSE Stream]   : http://%s/events\n", ip_buf);
+				printk("  [Download CSV] : http://%s/download\n", ip_buf);
+				printk("  [Status API]   : http://%s/status\n", ip_buf);
+				printk("============================================================\n\n");
+
 				k_sem_give(&ntp_trigger_sem);
 				break;
 			}
@@ -732,7 +1075,8 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		break;
 	}
 	case NET_EVENT_IPV4_ADDR_DEL: {
-		printk("[Wi-Fi] IPv4 address released\n");
+		printk("[Wi-Fi] IPv4 address lease released / expired (%s)\n", assigned_ipv4_str);
+		assigned_ipv4_str[0] = '\0';
 		wifi_has_ip = false;
 		break;
 	}
@@ -744,72 +1088,54 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 static void trigger_wifi_connect(void)
 {
 	struct net_if *iface = net_if_get_default();
+	wifi_attempt_count++;
+
+	char mac_str[18] = "Unknown MAC";
+	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
+	if (link_addr && link_addr->len == 6) {
+		snprintk(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
+		         link_addr->addr[0], link_addr->addr[1], link_addr->addr[2],
+		         link_addr->addr[3], link_addr->addr[4], link_addr->addr[5]);
+	}
+
+	const char *sec_str = (strlen(CONFIG_APP_WIFI_PSK) > 0) ? "WPA2-PSK" : "Open";
+	printk("\n[Wi-Fi] -----------------------------------------------------\n");
+	printk("[Wi-Fi] Initiating connection attempt #%u...\n", wifi_attempt_count);
+	printk("[Wi-Fi]   Target SSID : %s\n", CONFIG_APP_WIFI_SSID);
+	printk("[Wi-Fi]   Security    : %s\n", sec_str);
+	printk("[Wi-Fi]   Station MAC : %s\n", mac_str);
+	printk("[Wi-Fi]   Band        : 2.4 GHz (802.11 b/g/n)\n");
+	printk("[Wi-Fi] -----------------------------------------------------\n");
+
 	struct wifi_connect_req_params params = {
 		.ssid = CONFIG_APP_WIFI_SSID,
 		.ssid_length = strlen(CONFIG_APP_WIFI_SSID),
 		.psk = CONFIG_APP_WIFI_PSK,
 		.psk_length = strlen(CONFIG_APP_WIFI_PSK),
-		.channel = 0,
-		.security = strlen(CONFIG_APP_WIFI_PSK) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
+		.channel = WIFI_CHANNEL_ANY,
+		.security = (strlen(CONFIG_APP_WIFI_PSK) > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
+		.band = WIFI_FREQ_BAND_2_4_GHZ,
+		.mfp = WIFI_MFP_OPTIONAL,
 	};
 
-	printk("[Wi-Fi] Requesting connection to '%s'...\n", CONFIG_APP_WIFI_SSID);
-	net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
-}
-
-static void setup_wifi_callbacks(void)
-{
-	net_mgmt_init_event_callback(&wifi_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
-	net_mgmt_add_event_callback(&wifi_cb);
-
-	net_mgmt_init_event_callback(&ipv4_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
-	net_mgmt_add_event_callback(&ipv4_cb);
-}
-
-/* ========================================================================= */
-/* Thread 5 (Lowest Priority): Background NTP Time Synchronizer              */
-/* ========================================================================= */
-static void ntp_sync_thread_fn(void *p1, void *p2, void *p3)
-{
-	ARG_UNUSED(p1);
-	ARG_UNUSED(p2);
-	ARG_UNUSED(p3);
-
-	printk("[Thread 5: Background NTP] Started (Priority %d)\n", PRIORITY_NTP);
-
-	while (1) {
-		/* If already synchronized, sleep for 1 hour before routine re-sync.
-		 * If not synchronized yet, wait up to 10 seconds or until Wi-Fi connects. */
-		k_timeout_t wait_timeout = ntp_synced ? K_HOURS(1) : K_SECONDS(10);
-		k_sem_take(&ntp_trigger_sem, wait_timeout);
-
-		if (!wifi_has_ip) {
-			continue;
-		}
-
-		printk("[NTP Background] Querying pool.ntp.org...\n");
-		struct sntp_time sntp_res;
-		int ret = sntp_simple("pool.ntp.org", 4000, &sntp_res);
-		if (ret < 0) {
-			printk("[NTP Background] pool.ntp.org failed (%d), retrying with time.google.com...\n", ret);
-			ret = sntp_simple("time.google.com", 4000, &sntp_res);
-		}
-
-		if (ret == 0) {
-			k_mutex_lock(&time_mutex, K_FOREVER);
-			ntp_epoch_sec = (int64_t)sntp_res.seconds;
-			ntp_sync_uptime = k_uptime_get();
-			ntp_synced = true;
-			k_mutex_unlock(&time_mutex);
-			printk("[NTP Background] Time synchronized successfully! Epoch: %lld (next sync in 1h)\n",
-			       (long long)ntp_epoch_sec);
-		} else {
-			printk("[NTP Background] Query failed (err %d), will retry in 15s...\n", ret);
-			k_sleep(K_SECONDS(15));
-		}
+	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
+	if (ret) {
+		printk("[Wi-Fi] ERROR: Connect request failed immediately (err: %d)\n", ret);
+	} else {
+		printk("[Wi-Fi] Connect request queued. Waiting for association callback...\n");
 	}
+}
+
+static int get_query_param_int(const char *req, const char *param, int default_val)
+{
+	char needle[32];
+	snprintf(needle, sizeof(needle), "%s=", param);
+	const char *p = strstr(req, needle);
+	if (!p) {
+		return default_val;
+	}
+	p += strlen(needle);
+	return atoi(p);
 }
 
 static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
@@ -818,11 +1144,18 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p2);
 	ARG_UNUSED(p3);
 
-	printk("[Thread 4: Wi-Fi & Web Server] Started (Priority %d)\n", PRIORITY_WIFI);
+	printk("[Thread 2: Wi-Fi & Web Server] Started (Priority %d)\n", PRIORITY_WIFI);
 
-	setup_wifi_callbacks();
-	trigger_wifi_connect();
+	net_mgmt_init_event_callback(&wifi_cb, wifi_mgmt_event_handler,
+	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
+	net_mgmt_add_event_callback(&wifi_cb);
 
+	net_mgmt_init_event_callback(&ipv4_cb, wifi_mgmt_event_handler,
+	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
+	net_mgmt_add_event_callback(&ipv4_cb);
+
+	int64_t last_reconnect_attempt = 0;
+	int64_t last_dhcp_log = 0;
 	int server_fd = -1;
 	sse_client_t sse_clients[MAX_SSE_CLIENTS];
 	for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
@@ -830,39 +1163,40 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		sse_clients[i].last_sent_id = 0;
 	}
 
-	int64_t last_reconnect_attempt = k_uptime_get();
-
 	while (1) {
 		int64_t now = k_uptime_get();
-
-		/* Auto-reconnect supervisor: If Wi-Fi is lost, retry every 5 seconds */
-		if (!wifi_connected && (now - last_reconnect_attempt > 5000)) {
+		sync_time_to_app_cpu(now, false);
+		if (!wifi_connected && (now - last_reconnect_attempt > 10000)) {
 			last_reconnect_attempt = now;
 			trigger_wifi_connect();
 		}
 
-		/* If Wi-Fi is disconnected or IP not assigned, clean up dead SSE client sockets */
 		if (!wifi_has_ip) {
+			if (wifi_connected && (now - last_dhcp_log > 5000)) {
+				last_dhcp_log = now;
+				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease...\n",
+				       CONFIG_APP_WIFI_SSID);
+			}
+
+			if (server_fd >= 0) {
+				close(server_fd);
+				server_fd = -1;
+			}
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 				if (sse_clients[i].fd >= 0) {
 					close(sse_clients[i].fd);
 					sse_clients[i].fd = -1;
 				}
 			}
-			if (server_fd >= 0) {
-				close(server_fd);
-				server_fd = -1;
-			}
-			k_sleep(K_MSEC(250));
+			k_sleep(K_MSEC(500));
 			continue;
 		}
 
-		/* Initialize listening server socket once IP is acquired */
 		if (server_fd < 0) {
 			server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
 			if (server_fd < 0) {
-				printk("[HTTP Server] Socket creation failed: %d\n", errno);
-				k_sleep(K_MSEC(500));
+				printk("[HTTP Server] Socket create failed (errno %d)\n", errno);
+				k_sleep(K_SECONDS(2));
 				continue;
 			}
 
@@ -876,23 +1210,22 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 			};
 
 			if (bind(server_fd, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-				printk("[HTTP Server] Bind failed on port %d: %d\n", HTTP_PORT, errno);
+				printk("[HTTP Server] Bind failed (errno %d)\n", errno);
 				close(server_fd);
 				server_fd = -1;
-				k_sleep(K_MSEC(1000));
+				k_sleep(K_SECONDS(2));
 				continue;
 			}
 
 			if (listen(server_fd, 5) < 0) {
-				printk("[HTTP Server] Listen failed: %d\n", errno);
+				printk("[HTTP Server] Listen failed (errno %d)\n", errno);
 				close(server_fd);
 				server_fd = -1;
-				k_sleep(K_MSEC(1000));
+				k_sleep(K_SECONDS(2));
 				continue;
 			}
 
-			printk("[HTTP Server] Listening on port %d (supports %d simultaneous SSE clients)...\n",
-			       HTTP_PORT, MAX_SSE_CLIENTS);
+			printk("[HTTP Server] Listening on port %d...\n", HTTP_PORT);
 		}
 
 		struct zsock_pollfd pfd[1 + MAX_SSE_CLIENTS];
@@ -930,13 +1263,24 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 			int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
 			if (client_fd >= 0) {
-				char rx_buf[256];
+				char rx_buf[512];
 				int rlen = recv(client_fd, rx_buf, sizeof(rx_buf) - 1, 0);
 				if (rlen > 0) {
 					rx_buf[rlen] = '\0';
 
+					/* Match OPTIONS (CORS preflight) */
+					if (strncmp(rx_buf, "OPTIONS", 7) == 0) {
+						const char *cors_resp =
+							"HTTP/1.1 204 No Content\r\n"
+							"Access-Control-Allow-Origin: *\r\n"
+							"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+							"Access-Control-Allow-Headers: *\r\n"
+							"Connection: close\r\n\r\n";
+						send_all(client_fd, cors_resp, strlen(cors_resp));
+						close(client_fd);
+					}
 					/* Match GET /events (Server-Sent Events) */
-					if (strncmp(rx_buf, "GET /events", 11) == 0) {
+					else if (strncmp(rx_buf, "GET /events", 11) == 0) {
 						int slot = -1;
 						for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 							if (sse_clients[i].fd < 0) {
@@ -954,9 +1298,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 								"Access-Control-Allow-Origin: *\r\n\r\n";
 
 							if (send_all(client_fd, sse_headers, strlen(sse_headers)) == 0) {
-								/* Stream recent CSV history before entering live mode */
 								replay_csv_history_to_sse(client_fd);
-
 								sse_clients[slot].fd = client_fd;
 								sse_clients[slot].last_sent_id = 0;
 								printk("[HTTP] SSE client #%d connected on fd %d\n",
@@ -986,6 +1328,180 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						                    sizeof(HTTP_HTML_PAGE) - 1);
 						send_all(client_fd, header, hlen);
 						send_all(client_fd, HTTP_HTML_PAGE, sizeof(HTTP_HTML_PAGE) - 1);
+						close(client_fd);
+					}
+					/* Match GET /download or GET /download.csv */
+					else if (strncmp(rx_buf, "GET /download", 13) == 0 ||
+					         strncmp(rx_buf, "GET /telemetry.csv", 18) == 0) {
+						if (g_download_in_progress) {
+							const char *busy_resp =
+								"HTTP/1.1 503 Service Unavailable\r\n"
+								"Content-Type: text/plain\r\n"
+								"Connection: close\r\n\r\n"
+								"Another CSV download is already in progress.\r\n";
+							send_all(client_fd, busy_resp, strlen(busy_resp));
+							close(client_fd);
+						} else {
+							g_download_client_fd = client_fd;
+							g_download_in_progress = true;
+							k_sem_give(&download_start_sem);
+						}
+					}
+					/* Match GET /api/profile/config */
+					else if (strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
+						if (strstr(rx_buf, "t_low=")) {
+							int t_low  = get_query_param_int(rx_buf, "t_low", g_active_profile_cfg.t_low_sec);
+							int p_low  = get_query_param_int(rx_buf, "p_low", g_active_profile_cfg.p_low_pct);
+							int t_up   = get_query_param_int(rx_buf, "t_up", g_active_profile_cfg.t_up_sec);
+							int t_high = get_query_param_int(rx_buf, "t_high", g_active_profile_cfg.t_high_sec);
+							int p_high = get_query_param_int(rx_buf, "p_high", g_active_profile_cfg.p_high_pct);
+							int t_drop = get_query_param_int(rx_buf, "t_drop", g_active_profile_cfg.t_drop_sec);
+
+							if (t_low < 0) { t_low = 0; } else if (t_low > 32768) { t_low = 32768; }
+							if (t_up < 0) { t_up = 0; } else if (t_up > 32768) { t_up = 32768; }
+							if (t_high < 0) { t_high = 0; } else if (t_high > 32768) { t_high = 32768; }
+							if (t_drop < 0) { t_drop = 0; } else if (t_drop > 32768) { t_drop = 32768; }
+							if (p_low < 0) { p_low = 0; } else if (p_low > 100) { p_low = 100; }
+							if (p_high < 0) { p_high = 0; } else if (p_high > 100) { p_high = 100; }
+
+							g_active_profile_cfg.t_low_sec = (uint16_t)t_low;
+							g_active_profile_cfg.p_low_pct = (uint8_t)p_low;
+							g_active_profile_cfg.t_up_sec = (uint16_t)t_up;
+							g_active_profile_cfg.t_high_sec = (uint16_t)t_high;
+							g_active_profile_cfg.p_high_pct = (uint8_t)p_high;
+							g_active_profile_cfg.t_drop_sec = (uint16_t)t_drop;
+							g_active_profile_cfg.action = PWM_ACTION_SET_CONFIG_ONLY;
+
+							if (ipm_dev && device_is_ready(ipm_dev)) {
+								ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+							}
+						}
+
+						char body[128];
+						int blen = snprintf(body, sizeof(body),
+						                    "{\"t_low\":%u,\"p_low\":%u,\"t_up\":%u,\"t_high\":%u,\"p_high\":%u,\"t_drop\":%u}\r\n",
+						                    g_active_profile_cfg.t_low_sec, g_active_profile_cfg.p_low_pct,
+						                    g_active_profile_cfg.t_up_sec, g_active_profile_cfg.t_high_sec,
+						                    g_active_profile_cfg.p_high_pct, g_active_profile_cfg.t_drop_sec);
+						char header[160];
+						int hlen = snprintf(header, sizeof(header),
+						                    "HTTP/1.1 200 OK\r\n"
+						                    "Content-Type: application/json\r\n"
+						                    "Access-Control-Allow-Origin: *\r\n"
+						                    "Content-Length: %d\r\n"
+						                    "Connection: close\r\n\r\n", blen);
+						send_all(client_fd, header, hlen);
+						send_all(client_fd, body, blen);
+						close(client_fd);
+					}
+					/* Match GET /api/profile/status */
+					else if (strncmp(rx_buf, "GET /api/profile/status", 23) == 0) {
+						telemetry_full_t cur;
+						k_spinlock_key_t key = k_spin_lock(&telemetry_spinlock);
+						cur = latest_telemetry;
+						k_spin_unlock(&telemetry_spinlock, key);
+
+						const char *st_names[] = {"Idle", "Low", "Ramp Up", "High", "Drop"};
+						const char *st_name = (cur.profile_stage <= 4) ? st_names[cur.profile_stage] : "Unknown";
+
+						char body[160];
+						int blen = snprintf(body, sizeof(body),
+						                    "{\"running\":%s,\"stage\":%u,\"stage_name\":\"%s\",\"elapsed_sec\":%u,\"total_sec\":%u,\"cur_pwm\":%u,\"rpm\":%u}\r\n",
+						                    (cur.profile_stage > 0) ? "true" : "false",
+						                    cur.profile_stage, st_name,
+						                    cur.profile_elapsed_sec, cur.profile_total_sec,
+						                    cur.pwm_pct, cur.motor_rpm);
+						char header[160];
+						int hlen = snprintf(header, sizeof(header),
+						                    "HTTP/1.1 200 OK\r\n"
+						                    "Content-Type: application/json\r\n"
+						                    "Access-Control-Allow-Origin: *\r\n"
+						                    "Content-Length: %d\r\n"
+						                    "Connection: close\r\n\r\n", blen);
+						send_all(client_fd, header, hlen);
+						send_all(client_fd, body, blen);
+						close(client_fd);
+					}
+					/* Match GET /api/profile/start or action=start */
+					else if (strncmp(rx_buf, "GET /api/profile/start", 22) == 0 ||
+					         (strncmp(rx_buf, "GET /api/profile", 16) == 0 && strstr(rx_buf, "action=start"))) {
+						if (strstr(rx_buf, "t_low=")) {
+							int t_low  = get_query_param_int(rx_buf, "t_low", g_active_profile_cfg.t_low_sec);
+							int p_low  = get_query_param_int(rx_buf, "p_low", g_active_profile_cfg.p_low_pct);
+							int t_up   = get_query_param_int(rx_buf, "t_up", g_active_profile_cfg.t_up_sec);
+							int t_high = get_query_param_int(rx_buf, "t_high", g_active_profile_cfg.t_high_sec);
+							int p_high = get_query_param_int(rx_buf, "p_high", g_active_profile_cfg.p_high_pct);
+							int t_drop = get_query_param_int(rx_buf, "t_drop", g_active_profile_cfg.t_drop_sec);
+
+							if (t_low < 0) { t_low = 0; } else if (t_low > 32768) { t_low = 32768; }
+							if (t_up < 0) { t_up = 0; } else if (t_up > 32768) { t_up = 32768; }
+							if (t_high < 0) { t_high = 0; } else if (t_high > 32768) { t_high = 32768; }
+							if (t_drop < 0) { t_drop = 0; } else if (t_drop > 32768) { t_drop = 32768; }
+							if (p_low < 0) { p_low = 0; } else if (p_low > 100) { p_low = 100; }
+							if (p_high < 0) { p_high = 0; } else if (p_high > 100) { p_high = 100; }
+
+							g_active_profile_cfg.t_low_sec = (uint16_t)t_low;
+							g_active_profile_cfg.p_low_pct = (uint8_t)p_low;
+							g_active_profile_cfg.t_up_sec = (uint16_t)t_up;
+							g_active_profile_cfg.t_high_sec = (uint16_t)t_high;
+							g_active_profile_cfg.p_high_pct = (uint8_t)p_high;
+							g_active_profile_cfg.t_drop_sec = (uint16_t)t_drop;
+						}
+						g_active_profile_cfg.action = PWM_ACTION_START_PROFILE;
+						if (ipm_dev && device_is_ready(ipm_dev)) {
+							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+						}
+						const char *resp =
+							"HTTP/1.1 200 OK\r\n"
+							"Content-Type: application/json\r\n"
+							"Access-Control-Allow-Origin: *\r\n"
+							"Content-Length: 20\r\n"
+							"Connection: close\r\n\r\n"
+							"{\"status\":\"started\"}\r\n";
+						send_all(client_fd, resp, strlen(resp));
+						close(client_fd);
+					}
+					/* Match GET /api/profile/stop or action=stop */
+					else if (strncmp(rx_buf, "GET /api/profile/stop", 21) == 0 ||
+					         (strncmp(rx_buf, "GET /api/profile", 16) == 0 && strstr(rx_buf, "action=stop"))) {
+						g_active_profile_cfg.action = PWM_ACTION_STOP_PROFILE;
+						if (ipm_dev && device_is_ready(ipm_dev)) {
+							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+						}
+						const char *resp =
+							"HTTP/1.1 200 OK\r\n"
+							"Content-Type: application/json\r\n"
+							"Access-Control-Allow-Origin: *\r\n"
+							"Content-Length: 20\r\n"
+							"Connection: close\r\n\r\n"
+							"{\"status\":\"stopped\"}\r\n";
+						send_all(client_fd, resp, strlen(resp));
+						close(client_fd);
+					}
+					/* Match GET /api/pwm?val=... */
+					else if (strncmp(rx_buf, "GET /api/pwm", 12) == 0) {
+						int target_val = get_query_param_int(rx_buf, "val", 50);
+						if (target_val < 0) target_val = 0;
+						if (target_val > 100) target_val = 100;
+
+						ipm_pwm_ctrl_t cmd = {
+							.action = PWM_ACTION_MANUAL_PWM,
+							.manual_pwm = (uint8_t)target_val,
+						};
+						if (ipm_dev && device_is_ready(ipm_dev)) {
+							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
+						}
+						char body[64];
+						int blen = snprintf(body, sizeof(body), "{\"status\":\"ok\",\"pwm\":%d}\r\n", target_val);
+						char header[160];
+						int hlen = snprintf(header, sizeof(header),
+						                    "HTTP/1.1 200 OK\r\n"
+						                    "Content-Type: application/json\r\n"
+						                    "Access-Control-Allow-Origin: *\r\n"
+						                    "Content-Length: %d\r\n"
+						                    "Connection: close\r\n\r\n", blen);
+						send_all(client_fd, header, hlen);
+						send_all(client_fd, body, blen);
 						close(client_fd);
 					}
 					/* 404 for unknown endpoints */
@@ -1030,15 +1546,15 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		}
 
 		/* 3. Push latest telemetry frame to active SSE clients */
-		telemetry_packet_t cur;
+		telemetry_full_t cur;
 		bool has_new_packet = false;
 
-		k_mutex_lock(&telemetry_mutex, K_FOREVER);
+		k_spinlock_key_t key = k_spin_lock(&telemetry_spinlock);
 		if (has_telemetry) {
 			cur = latest_telemetry;
 			has_new_packet = true;
 		}
-		k_mutex_unlock(&telemetry_mutex);
+		k_spin_unlock(&telemetry_spinlock, key);
 
 		if (has_new_packet) {
 			int active_count = 0;
@@ -1059,11 +1575,15 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 				uint32_t volt_int  = cur.bus_mv / 1000;
 				uint32_t volt_frac = (cur.bus_mv % 1000) / 10;
 
-				char sse_data[240];
+				char sse_data[320];
 				int sse_len = snprintf(sse_data, sizeof(sse_data),
-				                       "data: {\"id\":%u,\"rpm\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%u,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s}\n\n",
+				                       "data: {\"id\":%u,\"rpm\":%u,\"pwm\":%u,\"stage\":%u,\"prof_sec\":%u,\"prof_tot\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s}\n\n",
 				                       cur.sample_id,
 				                       cur.motor_rpm,
+				                       cur.pwm_pct,
+				                       cur.profile_stage,
+				                       cur.profile_elapsed_sec,
+				                       cur.profile_total_sec,
 				                       temp_int, temp_frac,
 				                       volt_int, volt_frac,
 				                       cur.current_ma,
@@ -1090,19 +1610,81 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 }
 
 /* ========================================================================= */
-/* Static Thread Definitions                                                 */
+/* Thread 3: Decoupled Background NTP Synchronization                        */
 /* ========================================================================= */
-K_THREAD_DEFINE(thread_speed, THREAD_STACK_SIZE, motor_speed_thread_fn,
-                NULL, NULL, NULL, PRIORITY_HIGH, 0, 0);
+static void ntp_sync_thread_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
 
-K_THREAD_DEFINE(thread_aggregator, THREAD_STACK_SIZE, sensor_aggregator_thread_fn,
-                NULL, NULL, NULL, PRIORITY_MEDIUM, 0, 0);
+	printk("[Thread 3: NTP Client] Started (Priority %d)\n", PRIORITY_NTP);
+
+	while (1) {
+		k_sem_take(&ntp_trigger_sem, K_FOREVER);
+		printk("[NTP] Querying pool.ntp.org...\n");
+
+		struct sntp_time sntp_time;
+		int ret = sntp_simple("pool.ntp.org", 5000, &sntp_time);
+		if (ret == 0) {
+			k_spinlock_key_t key = k_spin_lock(&time_spinlock);
+			ntp_epoch_sec = sntp_time.seconds;
+			ntp_sync_uptime = k_uptime_get();
+			ntp_synced = true;
+			k_spin_unlock(&time_spinlock, key);
+
+			char iso[32], date[16];
+			get_formatted_time(iso, sizeof(iso), date, sizeof(date));
+			printk("[NTP] Time synchronized! Current Local (UTC+8): %s (epoch %lld)\n",
+			       iso, (long long)ntp_epoch_sec);
+			sync_time_to_app_cpu(k_uptime_get(), true);
+		} else {
+			printk("[NTP] Sync attempt failed (%d), will retry in 30s\n", ret);
+			k_sleep(K_SECONDS(30));
+			if (wifi_has_ip) {
+				k_sem_give(&ntp_trigger_sem);
+			}
+			continue;
+		}
+
+		/* Re-sync NTP every 1 hour to correct hardware RTC drift */
+		k_sleep(K_SECONDS(3600));
+		if (wifi_has_ip) {
+			k_sem_give(&ntp_trigger_sem);
+		}
+	}
+}
+
+/* ========================================================================= */
+/* Thread 0: Core 1 (APP_CPU) IPC Print Console Consumer                     */
+/* ========================================================================= */
+static void ipc_console_thread_fn(void *p1, void *p2, void *p3)
+{
+	ARG_UNUSED(p1);
+	ARG_UNUSED(p2);
+	ARG_UNUSED(p3);
+
+	ipc_print_packet_t pkt;
+
+	while (1) {
+		if (k_msgq_get(&ipc_print_msgq, &pkt, K_FOREVER) == 0) {
+			printk("%s", pkt.msg);
+		}
+	}
+}
+
+/* Static Thread Allocations */
+K_THREAD_DEFINE(thread_ipc_console, IPC_CONSOLE_STACK_SIZE, ipc_console_thread_fn,
+                NULL, NULL, NULL, PRIORITY_IPC_CONSOLE, 0, 0);
 
 K_THREAD_DEFINE(thread_csv, CSV_STACK_SIZE, sdcard_csv_thread_fn,
                 NULL, NULL, NULL, PRIORITY_LOW, 0, 0);
 
 K_THREAD_DEFINE(thread_wifi_http, WIFI_STACK_SIZE, wifi_http_thread_fn,
                 NULL, NULL, NULL, PRIORITY_WIFI, 0, 0);
+
+K_THREAD_DEFINE(thread_csv_download, DOWNLOAD_STACK_SIZE, csv_download_thread_fn,
+                NULL, NULL, NULL, PRIORITY_DOWNLOAD, 0, 0);
 
 K_THREAD_DEFINE(thread_ntp, NTP_STACK_SIZE, ntp_sync_thread_fn,
                 NULL, NULL, NULL, PRIORITY_NTP, 0, 0);
@@ -1112,55 +1694,39 @@ K_THREAD_DEFINE(thread_ntp, NTP_STACK_SIZE, ntp_sync_thread_fn,
 /* ========================================================================= */
 int main(void)
 {
-	const struct device *const timer_dev = DEVICE_DT_GET(TIMER_NODE);
-	int err;
-
 	printk("=================================================================\n");
-	printk("Waveshare ESP32-S3-GEEK: Multi-Threaded Sensor & SD Web Server\n");
-	printk("Architecture: Xtensa Dual-Core ESP32-S3 (PROCPU Primary)\n");
-	printk("HW Timer: %s (%s)\n", timer_dev->name, DT_NODE_PATH(TIMER_NODE));
+	printk("Waveshare ESP32-S3-GEEK: PRO_CPU (Core 0) Primary Multi-Core Host\n");
+	printk("Architecture: Dual-Core Xtensa LX7 AMP via Sysbuild\n");
+	printk("Subsystems: Wi-Fi HTTP/SSE, FAT32 SDCard Logger, NTP Clock Sync\n");
 	printk("=================================================================\n");
 
-	if (!device_is_ready(timer_dev)) {
-		printk("FATAL: Counter device %s is not ready!\n", timer_dev->name);
-		return -ENODEV;
+	ipm_dev = DEVICE_DT_GET(DT_NODELABEL(ipm0));
+	if (!ipm_dev || !device_is_ready(ipm_dev)) {
+		printk("[PRO_CPU] WARNING: IPM device not ready at boot\n");
+	} else {
+		ipm_register_callback(ipm_dev, ipm_receive_callback, NULL);
+		ipm_set_enabled(ipm_dev, 1);
+		printk("[PRO_CPU] IPM receiver registered on channels %d (telemetry) and %d (console)\n",
+		       IPM_CHANNEL_APP_TELEMETRY, IPM_CHANNEL_APP_PRINT);
+		sync_time_to_app_cpu(k_uptime_get(), true);
 	}
-
-	uint32_t freq = counter_get_frequency(timer_dev);
-	printk("Timer frequency: %u Hz\n", freq);
-
-	/* Configure periodic top value (1~10 Hz auto-reload) */
-	struct counter_top_cfg top_cfg = {
-		.ticks = counter_us_to_ticks(timer_dev, TIMER_INTERVAL_US),
-		.callback = timer_top_subroutine,
-		.user_data = NULL,
-		.flags = 0,
-	};
-
-	printk("Starting hardware timer: period = %d us (%d Hz, %llu ticks)...\n",
-	       TIMER_INTERVAL_US, CONFIG_APP_SAMPLE_RATE_HZ,
-	       (unsigned long long)top_cfg.ticks);
-
-	err = counter_set_top_value(timer_dev, &top_cfg);
-	if (err) {
-		printk("FATAL: Failed to set counter top value: %d\n", err);
-		return err;
-	}
-
-	err = counter_start(timer_dev);
-	if (err) {
-		printk("FATAL: Failed to start counter: %d\n", err);
-		return err;
-	}
-
-	printk("Hardware timer running. Pipeline, SD logger, & Wi-Fi Server active.\n\n");
 
 	while (1) {
 		k_sleep(K_SECONDS(30));
-		printk("[Supervisor] System healthy, 64-bit uptime: %lld ms | Wi-Fi: %s | NTP: %s\n",
-		       k_uptime_get(),
-		       wifi_has_ip ? "Connected" : (wifi_connected ? "Associated (No IP)" : "Disconnected"),
-		       ntp_synced ? "Synced" : "Pending");
+		const char *wifi_state_str;
+		if (wifi_has_ip) {
+			wifi_state_str = assigned_ipv4_str;
+		} else if (wifi_connected) {
+			wifi_state_str = "Associated (Waiting for DHCP)";
+		} else {
+			wifi_state_str = "Disconnected (Retrying)";
+		}
+
+		printk("[PRO_CPU Supervisor] Uptime: %lld s | Wi-Fi: %s | NTP: %s | Attempts: %u\n",
+		       k_uptime_get() / 1000,
+		       wifi_state_str,
+		       ntp_synced ? "Synced" : "Pending",
+		       wifi_attempt_count);
 	}
 
 	return 0;

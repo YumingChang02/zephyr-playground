@@ -45,44 +45,110 @@ When running in AMP mode, the 16 MB flash and internal SRAM are divided accordin
 
 ---
 
-## Application Architecture
+## Application Architecture (Multi-Core AMP via Sysbuild)
 
-The active firmware runs a multi-threaded RTOS pipeline supporting a **1~10 Hz update cycle** (`CONFIG_APP_SAMPLE_RATE_HZ`), real hardware drivers (GPIO FG pulse counter, 25 kHz LEDC PWM, INA219 I2C voltage/current sensor), FAT32 SD card CSV logging with daily auto-rotation, a dedicated background NTP client, and an embedded Wi-Fi web dashboard:
+The firmware runs a **true Asymmetric Multiprocessing (AMP)** pipeline across both Xtensa cores:
+- **Core 1 (`APP_CPU` / `remote`)**: Executes dedicated hard real-time tasks (hardware counter ISR at 1~10 Hz, GPIO FG pulse counter, 25 kHz LEDC PWM motor drive, and INA219 I2C sampling) with zero jitter. Telemetry packets are sent to Core 0 via Inter-Processor Mailbox (`ipm0` Channel 2).
+- **Core 0 (`PRO_CPU` / `app`)**: Ingests IPM telemetry packets, manages FAT32 SD card CSV logging with daily auto-rotation, synchronizes wall-clock time via background NTP, and hosts the multi-client SSE Web Dashboard over Wi-Fi.
 
 ```text
-[Hardware Timer ISR (1~10 Hz)]
-       │ (k_sem_give)
-       ▼
-[Thread 1: Motor Speed & PWM (Priority 3)]
-       │ (motor_speed_msgq)
-       ▼
-[Thread 2: Sensor Aggregator (Priority 5)]
-       ├── (csv_msgq)        ──> [Thread 3: SD Card FAT32 CSV Logger (Priority 7)]
-       └── (k_condvar)       ──> [Thread 4: Wi-Fi & Multi-Client SSE Server (Priority 8)]
-                                        │ (k_sem_give on IP acquired)
-                                        ▼
-                                 [Thread 5: Background NTP Client (Priority 10)]
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │                      Core 1: APP_CPU (remote)                          │
+ │                                                                        │
+ │  [Hardware Timer ISR (1~10 Hz)]                                        │
+ │         │ (k_sem_give)                                                 │
+ │         ▼                                                              │
+ │  [Thread 1: Motor Speed & PWM (Priority 3)]                            │
+ │         │ (motor_speed_msgq)                                           │
+ │         ▼                                                              │
+ │  [Thread 2: Sensor Aggregator (Priority 5)]                            │
+ │         │ (ipm_send: Channel 2)                                        │
+ │         ▼                                                              │
+ │  [Thread 3: 3-Bar LCD Display Engine (Priority 9)]                     │
+ │         └── ST7789 SPI Display: PWM %, FG %, Power % (10 Hz)          │
+ └─────────┼──────────────────────────────────────────────────────────────┘
+           │ Hardware Inter-Processor Mailbox (ipm0)
+           ▼
+ ┌────────────────────────────────────────────────────────────────────────┐
+ │                      Core 0: PRO_CPU (app)                             │
+ │                                                                        │
+ │  [IPM Receive Callback (ISR)]                                          │
+ │         ├── (csv_msgq)  ──> [Thread 1: SD Card FAT32 Logger (Prio 7)]  │
+ │         │                        └── Daily rotation (max 7 kept)       │
+ │         └── (condvar)   ──> [Thread 2: Wi-Fi & Web Server (Prio 8)]    │
+ │                                      ├── Dashboard (GET /)             │
+ │                                      ├── CSV Download (GET /download)  │
+ │                                      └── SSE Stream (GET /events)      │
+ │                                      │ (signals on IP acquired)        │
+ │                                      ▼                                 │
+ │                               [Thread 3: Background NTP (Prio 10)]     │
+ └────────────────────────────────────────────────────────────────────────┘
 ```
 
-| Thread | Priority | Stack | Function |
-| :--- | :---: | :---: | :--- |
-| **Thread 1: Motor Speed & PWM** | 3 (High) | 2 KB | Unblocks on hardware counter ISR (`timer_tick_sem` at 1~10 Hz). Reads falling-edge pulses from GPIO 6 (FG feedback pin), computes motor RPM, drives motor PWM at 25 kHz on GPIO 7, and pushes into `motor_speed_msgq`. |
-| **Thread 2: Sensor Aggregator** | 5 (Med) | 2 KB | Drains `motor_speed_msgq`, samples bus voltage and current from INA219 via I2C0 (`0x40`), timestamps via synchronized NTP clock, and updates live telemetry cache. |
-| **Thread 3: SD Card CSV Logger** | 7 (Low) | 4 KB | Mounts SD card as FAT32 (auto-formatting on startup if unformatted), writes telemetry CSV records, flushes periodically to protect flash, and auto-rotates daily (`/SD:/telemetry_YYYY-MM-DD.csv`). |
-| **Thread 4: Wi-Fi & Web Server** | 8 (Background) | 6 KB | Connects to Wi-Fi with auto-reconnect supervisor, serves standalone canvas dashboard at `GET /`, and streams live events + up to 1 hour CSV history to multiple clients at `GET /events`. |
-| **Thread 5: Background NTP Client** | 10 (Lowest) | 3 KB | Decoupled background synchronizer. Synchronizes wall-clock time from `pool.ntp.org` upon network connection and repeats every 1 hour to eliminate RTC drift without blocking the web server or sensor loop. |
+| Core | Subsystem / Thread | Priority | Function |
+| :--- | :--- | :---: | :--- |
+| **APP_CPU** | **Thread 1: Motor Speed & PWM** | 3 (High) | Unblocks on counter ISR (`timer_tick_sem` at 1~10 Hz). Reads falling-edge pulses from GPIO 6, computes motor RPM, and drives 25 kHz PWM on GPIO 14. |
+| **APP_CPU** | **Thread 2: Sensor Aggregator** | 5 (Med) | Samples bus voltage and current from INA219 via I2C0 (`0x40`), packages `telemetry_packet_t`, and transmits via IPM Channel 2. |
+| **APP_CPU** | **Thread 3: LCD Display Engine** | 9 (Low) | Drives onboard 1.14" ST7789 LCD over SPI at 10 Hz. Renders 3 horizontal gauge bars: PWM Target %, FG RPM %, and Power (W) %. |
+| **PRO_CPU** | **Thread 1: SD Card CSV Logger** | 7 (Low) | Mounts SD card as FAT32, writes telemetry CSV records, flushes periodically, and auto-rotates daily (`/SD:/telemetry_YYYY-MM-DD.csv`) with automatic pruning (`MAX_CSV_FILES_RETAINED = 7`). |
+| **PRO_CPU** | **Thread 2: Wi-Fi & Web Server** | 8 (Background) | Connects to Wi-Fi with auto-reconnect supervisor, serves standalone canvas dashboard at `GET /`, direct file download at `GET /download`, and streams live SSE + CSV history at `GET /events`. |
+| **PRO_CPU** | **Thread 3: Background NTP Client** | 10 (Lowest) | Synchronizes wall-clock time from `pool.ntp.org` to give precise absolute timestamps to CSV logs and Web UI. |
 
 ---
 
-## Web Server & SSE Endpoints
+## Web Server & HTTP Endpoints
 
 1. **`GET /` (Interactive Canvas Dashboard)**:
    - Self-contained dark-theme HTML5 dashboard (zero CDN dependencies).
    - Dual Canvas charts with **interactive hover inspection**: hovering or touching either chart draws a vertical crosshair and displays a dynamic floating tooltip showing exact timestamp, RPM, temperature, voltage, and current values.
+   - Includes a one-click **`📥 Download CSV`** button in the dashboard header.
    - Status indicators for Wi-Fi connection, active SSE client count, NTP sync state, and SD card logging.
-2. **`GET /events` (Server-Sent Events Stream)**:
+2. **`GET /download` or `GET /telemetry.csv` (CSV File Download)**:
+   - Streams the active day's CSV log directly from the SD card to the browser as an attachment (`Content-Disposition: attachment; filename="telemetry_YYYY-MM-DD.csv"`).
+3. **`GET /events` (Server-Sent Events Stream)**:
    - Supports **multiple simultaneous clients** (`MAX_SSE_CLIENTS = 4`) multiplexed using non-blocking I/O (`zsock_poll`).
    - **Recent History Replay**: When a client connects, reads the last data (clipped to max 1 hour = 3600 samples) from the current day's CSV file on the SD card, sends it over SSE (tagged with `"hist":true`), and then seamlessly continues streaming live telemetry events!
+
+---
+
+## SD Card CSV Storage & Rotation Limit
+
+- **Daily Rotation**: Log files are formatted as `/SD:/telemetry_YYYY-MM-DD.csv` based on wall-clock time from NTP.
+- **Retention Limit (`MAX_CSV_FILES_RETAINED`)**: Configured via `#define MAX_CSV_FILES_RETAINED 7` in [app/src/main.c](file:///home/markchang/zephyr-playground/ESP32-S3-GEEK/app/src/main.c).
+- **Auto-Pruning**: At each midnight rotation, the SD card logger enumerates all daily CSV files chronologically and automatically deletes the oldest logs when the total count exceeds `MAX_CSV_FILES_RETAINED`, preventing the FAT32 filesystem from filling up.
+
+---
+
+## Onboard 1.14" ST7789 LCD Screen (APP_CPU Gauge & Time Display)
+
+The Waveshare ESP32-S3-GEEK features an onboard 240x136 IPS LCD display driven by Core 1 (`APP_CPU`) via SPI at a low priority (`Priority 9`):
+
+### Visual Screen Layout (Stacked Bars + Right Time Widget)
+- **Left Area (X = 4..161, Width 158 px) — 3 Vertically Stacked Bars with No Spacing**:
+  - **Top Bar (Cyan `0x07FF`, Y = 2..45, Height 44 px)**: PWM Target (`0% ~ 100%`)
+  - **Middle Bar (Bright Green `0x07E0`, Y = 46..89, Height 44 px)**: Motor FG Speed (`0% ~ 100%` of max RPM)
+  - **Bottom Bar (Amber/Orange `0xFD20`, Y = 90..133, Height 44 px)**: Power Consumption (`0% ~ 100%` of max Watts)
+  - Bars touch directly at Y = 45/46 and Y = 89/90 without dead space.
+- **Right Area (X = 166..235, Width 70 px, Y = 2..133) — Current Time Widget**:
+  - Top Indicator: `NTP` (emerald green when synced) or `SYNC` (amber)
+  - **Line 1**: `MM/DD` (e.g. `11/17` in cool mint/cyan)
+  - **Line 2**: `HH:MM:SS` (e.g. `10:45:00` in warm gold)
+  - Bottom Tag: `UTC`
+  - Current wall-clock time is synced from `PRO_CPU` to `APP_CPU` via Inter-Processor Mailbox (`ipm0` Channel 4) every 500 ms.
+
+### Configurable Scale Macros
+You can easily adjust the maximum RPM and maximum Power scales in [remote/src/main.c](file:///home/markchang/zephyr-playground/ESP32-S3-GEEK/remote/src/main.c):
+```c
+#define CONFIG_APP_MAX_FG_RPM   6000    /* 100% scale for Motor FG RPM (default: 6000 RPM) */
+#define CONFIG_APP_MAX_POWER_W  25      /* 100% scale for Power in Watts (default: 25 W)   */
+```
+
+### Hardware Pinout Allocation
+- **Display SPI2**: SCLK = GPIO 12, MOSI = GPIO 11, CS = GPIO 10, DC = GPIO 8, RST = GPIO 9
+- **LCD Backlight**: GPIO 7 (controlled via `gpio-leds` node `lcd-bl`)
+- **Motor PWM Output**: GPIO 14 (external 3-pin header)
+- **Motor FG Pulse Input**: GPIO 6 (external 3-pin header, pull-up, falling edge ISR)
+- **INA219 Current/Voltage Sensor**: I2C0 (SDA = GPIO 4, SCL = GPIO 5, address `0x40`)
 
 ---
 
@@ -105,93 +171,58 @@ Wi-Fi credentials are kept private and out of version control using `credentials
 
 ## Building and Flashing Workflows
 
-Depending on your architecture goals, Zephyr supports three build and execution workflows for the ESP32-S3:
-
 ---
 
-### Workflow 1: Unified Preemptive Pipeline on PRO_CPU (Current Default)
+### Workflow 2: Unified Multi-Core AMP with Sysbuild (`PRO_CPU` + `APP_CPU`) (Active Default)
 
-The active application implements a 5-thread real-time preemptive pipeline on `PRO_CPU`. Because Zephyr RTOS uses strict priority preemption, Thread 1 (Priority 3) and Thread 2 (Priority 5) sample sensors and pulse counters at 1~10 Hz with **microsecond latency**, preempting background Wi-Fi (Priority 8) and SD card writes (Priority 7) without requiring inter-core IPC marshaling.
+The active application implements a multi-core AMP architecture:
+- `APP_CPU` (Core 1) is dedicated exclusively to real-time motor control (LEDC PWM, FG counter) and INA219 I2C sampling.
+- `PRO_CPU` (Core 0) handles Wi-Fi, FatFS SD logging, NTP synchronization, and the HTTP/SSE web server.
+- Zephyr's **`sysbuild`** orchestrates compiling MCUboot, `remote` (`APP_CPU`), and `app` (`PRO_CPU`), and flashing everything in a single step.
 
-From this folder (`~/zephyr-playground/ESP32-S3-GEEK`):
-
-#### 1. Build
-```bash
-# Pristine / clean build:
-uv run west build -p always -b esp32s3_geek/esp32s3/procpu app
-
-# Incremental build:
-uv run west build app
-
-# Fast C/C++ source rebuild (bypasses Python checks):
-uv run ninja -C build
-```
-
-#### 2. Flash
-Connect the ESP32-S3-GEEK USB stick to your computer and run:
-```bash
-uv run west flash
-```
-
-#### 3. Monitor Serial Console
-```bash
-uv run west espressif monitor
-```
-*(Press `Ctrl + ]` to exit the monitor).*
-
----
-
-### Workflow 2: Unified Multi-Core AMP with Sysbuild (`PRO_CPU` + `APP_CPU`)
-
-When dedicating `APP_CPU` (Core 1) exclusively to real-time motor control and sensor acquisition while `PRO_CPU` (Core 0) handles Wi-Fi, FatFS SD logging, and the web server, Zephyr's **`sysbuild`** orchestrates compiling and flashing both cores in a single pass.
-
-#### 1. Multi-Core Directory Layout
+#### 1. Directory Structure
 ```text
 ESP32-S3-GEEK/
-├── CMakeLists.txt                  <-- Root CMake file
 ├── sysbuild.cmake                  <-- Sysbuild orchestration script
+├── Kconfig.sysbuild                <-- Sysbuild Kconfig source
+├── include/
+│   └── telemetry.h                 <-- Shared telemetry packet struct & IPM IDs
 ├── app/                            <-- Primary application (PRO_CPU: Wi-Fi, SD, HTTP/SSE)
 │   ├── CMakeLists.txt
 │   ├── prj.conf
 │   ├── app.overlay
+│   ├── sysbuild.cmake
+│   ├── Kconfig.sysbuild
+│   ├── credentials.conf (local)
 │   └── src/main.c
-└── remote/                         <-- Secondary application (APP_CPU: FG Counter, PWM, I2C)
+└── remote/                         <-- Real-time application (APP_CPU: FG Counter, PWM, I2C)
     ├── CMakeLists.txt
     ├── prj.conf
     ├── app.overlay
     └── src/main.c
 ```
 
-#### 2. Configuring `sysbuild.cmake`
-In `ESP32-S3-GEEK/sysbuild.cmake`, register the secondary core as an external Zephyr project:
-```cmake
-# Automatically derive remote board qualifier from primary target:
-string(REPLACE "procpu" "appcpu" REMOTE_CPU "${BOARD_QUALIFIERS}")
-string(CONFIGURE "${BOARD}/${REMOTE_CPU}" IPM_REMOTE_BOARD)
-
-# Add APP_CPU application to sysbuild
-ExternalZephyrProject_Add(
-    APPLICATION app_cpu_firmware
-    SOURCE_DIR ${APP_DIR}/remote
-    BOARD ${IPM_REMOTE_BOARD}
-)
-
-# Ensure APP_CPU firmware compiles alongside PRO_CPU
-add_dependencies(app app_cpu_firmware)
-sysbuild_add_dependencies(CONFIGURE app app_cpu_firmware)
-```
-
-#### 3. Build Both Cores with Sysbuild
-Run a single `west build` command with the `--sysbuild` flag:
+#### 2. Build Both Cores with Sysbuild
+Run from `~/zephyr-playground/ESP32-S3-GEEK`:
 ```bash
+# Pristine / clean build:
 uv run west build --sysbuild -p always -b esp32s3_geek/esp32s3/procpu app
-```
-Sysbuild automatically:
-1. Configures and compiles `esp32s3_geek/esp32s3/appcpu` in `build/app_cpu_firmware/`.
-2. Configures and compiles `esp32s3_geek/esp32s3/procpu` in `build/app/`.
-3. Packages both ELF binaries and generates a unified multi-image flash specification.
 
-#### 4. Flash Both Cores in One Step
+# Incremental build:
+uv run west build --sysbuild app
+
+# Fast incremental rebuild of all images via ninja:
+uv run ninja -C build
+```
+
+Sysbuild automatically:
+1. Configures and compiles MCUboot bootloader.
+2. Configures and compiles `esp32s3_geek/esp32s3/appcpu` in `build/remote/`.
+3. Configures and compiles `esp32s3_geek/esp32s3/procpu` in `build/app/`.
+4. Packages and signs both ELF binaries with MCUboot partition offsets.
+
+#### 3. Flash All Cores in One Step
+Connect the ESP32-S3-GEEK USB stick and run:
 ```bash
 uv run west flash
 ```
@@ -199,6 +230,22 @@ uv run west flash
 - MCUboot bootloader and partition table to `0x0000`
 - `PRO_CPU` image to `slot0_partition` (`0x020000`)
 - `APP_CPU` image to `slot0_appcpu_partition` (`0xBC0000`)
+
+#### 4. Monitor Serial Console
+```bash
+uv run west espressif monitor
+```
+*(Press `Ctrl + ]` to exit).*
+
+---
+
+### Workflow 1: Single-Core Pipeline on PRO_CPU (Legacy Alternative)
+
+If running solely on Core 0 without multi-core AMP:
+```bash
+uv run west build -p always -b esp32s3_geek/esp32s3/procpu app
+uv run west flash
+```
 
 ---
 
@@ -228,7 +275,7 @@ uv run west flash -d build/appcpu --esp-app-address 0xbc0000
 
 ## Inter-Core Communication (IPM & Shared Memory)
 
-In AMP multi-core mode, data exchange between `PRO_CPU` and `APP_CPU` is managed via Zephyr's Inter-Processor Mailbox (`ipm0`) and 16 KB Shared SRAM (`shm0`):
+In AMP multi-core mode, data exchange and console routing between `PRO_CPU` and `APP_CPU` is managed via Zephyr's Inter-Processor Mailbox (`ipm0`) and Shared Memory (`shm0`):
 
 1. **Devicetree Binding**:
    Both `esp32s3_geek_esp32s3_procpu.dts` and `esp32s3_geek_esp32s3_appcpu.dts` define:
@@ -239,41 +286,39 @@ In AMP multi-core mode, data exchange between `PRO_CPU` and `APP_CPU` is managed
    };
    ```
 
-2. **Shared Telemetry Struct in `shm0`**:
-   Place the shared sensor struct in the uncached `shm0` address block (`0x3FCE5400`):
-   ```c
-   #define SHARED_MEM_ADDR 0x3FCE5400
-   static volatile telemetry_packet_t *shm_telemetry = (volatile telemetry_packet_t *)SHARED_MEM_ADDR;
-   ```
+2. **Dedicated IPM Channels**:
+   - **Channel 2 (`IPM_CHANNEL_APP_TELEMETRY`)**: Transmits packed 28-byte sensor samples (`telemetry_packet_t`) from Core 1 to Core 0 at 1~10 Hz with zero jitter.
+   - **Channel 3 (`IPM_CHANNEL_APP_PRINT`)**: Transmits `printk` log messages (`ipc_print_packet_t`) from Core 1 to Core 0.
 
-3. **Inter-Core Signaling via IPM**:
-   * **`APP_CPU` (Sender)**: After updating sensor data in `shm0`, sends a hardware interrupt pulse:
+3. **Inter-Core Signaling & Print Routing**:
+   - **`APP_CPU` (Sender)**: `printk()` is mapped to `app_printk()`, which formats the string and dispatches it over IPM Channel 3:
      ```c
-     const struct device *ipm = DEVICE_DT_GET(DT_CHOSEN(zephyr_ipc));
-     ipm_send(ipm, 0, 2, NULL, 0);  /* Channel 2 (application data channel) */
+     ipm_send(ipm, 1, IPM_CHANNEL_APP_PRINT, pkt.msg, strlen(pkt.msg) + 1);
      ```
-   * **`PRO_CPU` (Receiver)**: Registers an IPM callback to wake up the SD card logger and SSE broadcaster:
-     ```c
-     static void ipm_callback(const struct device *dev, void *user_data, uint32_t id, volatile void *data)
-     {
-         if (id == 2) {
-             /* Read from shm_telemetry, write to SD card, and stream to SSE */
-         }
-     }
-
-     ipm_register_callback(ipm, ipm_callback, NULL);
-     ipm_set_enabled(ipm, 1);
-     ```
+   - **`PRO_CPU` (Receiver & Console Output)**:
+     - The IPM ISR enqueues the message into `ipc_print_msgq` (`K_NO_WAIT`).
+     - A dedicated background thread (`thread_ipc_console`, Priority 6) pulls messages from `ipc_print_msgq` and prints them out via the hardware UART/USB console.
 
 ---
 
 ## Serial Console & Multi-Core Monitoring
 
-Both cores route their standard `printk()` output through the ESP32-S3 hardware:
+Core 0 (`PRO_CPU`) directly owns the serial console hardware. `APP_CPU` prints are seamlessly routed through IPM Channel 3:
 * To monitor serial output:
   ```bash
   uv run west espressif monitor
   ```
-* Messages printed by `APP_CPU` and `PRO_CPU` will be interleaved with core tags on the serial monitor.
+* Output from both `APP_CPU` and `PRO_CPU` appears interleaved with core tags on the serial monitor.
 * Press `Ctrl + ]` to exit the monitor.
+
+### Structured Wi-Fi Status Logs
+During boot and connection cycles, `PRO_CPU` provides detailed Wi-Fi diagnostics:
+1. **Connection Initiation**: Logs attempt counter, target SSID, security type (`WPA2-PSK`/`Open`), station MAC address, and frequency band.
+2. **Association Result**:
+   - **Success**: Displays association confirmation, textual status (`wifi_conn_status_txt`), and transition to DHCP request.
+   - **Failure**: Reports error status code, 802.11 status/reason codes (e.g. wrong password, AP not found), and 10s retry timer.
+3. **DHCP & Network Banner**: Once an IPv4 lease is granted, prints IP address, subnet mask, default gateway, web dashboard URL, and SSE endpoint URL.
+4. **Disconnection & Reconnect**: Identifies disconnection reason (`wifi_disconn_reason_txt`) and 802.11 reason code, resetting state and triggering auto-reconnect.
+5. **Periodic Supervisor**: Every 30 seconds, outputs uptime, live Wi-Fi state (`IP` / `Associated (Waiting for DHCP)` / `Disconnected (Retrying)`), NTP sync status, and total attempt count.
+
 

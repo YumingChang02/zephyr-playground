@@ -1,0 +1,173 @@
+#include <zephyr/dt-bindings/pwm/pwm.h>
+#include <zephyr/dt-bindings/pinctrl/esp32s3-pinctrl.h>
+#include <zephyr/dt-bindings/i2c/i2c.h>
+#include <zephyr/dt-bindings/display/panel.h>
+#include <zephyr/dt-bindings/mipi_dbi/mipi_dbi.h>
+
+/ {
+	aliases {
+		/* Portable application alias pointing to hardware counter */
+		app-timer = &counter0;
+		motor-pwm = &pwm_motor;
+		fg-pin = &fg_sensor;
+		lcd-bl = &lcd_bl;
+	};
+
+	chosen {
+		zephyr,ipc = &ipm0;
+		zephyr,display = &st7789p3;
+	};
+
+	lcd_backlight {
+		compatible = "gpio-leds";
+		lcd_bl: lcd_bl_0 {
+			gpios = <&gpio0 7 GPIO_ACTIVE_HIGH>;
+			label = "LCD Backlight Control";
+		};
+	};
+
+	motor_pwm {
+		compatible = "pwm-leds";
+		pwm_motor: pwm_motor_0 {
+			pwms = <&ledc0 0 PWM_USEC(40) PWM_POLARITY_INVERTED>; /* 25 kHz, Active-Low */
+			label = "Motor PWM Output";
+		};
+	};
+
+	sensor_pins {
+		compatible = "gpio-keys";
+		fg_sensor: fg_sensor_0 {
+			gpios = <&gpio0 6 GPIO_PULL_UP>;
+			label = "Motor FG Pulse Input";
+		};
+	};
+
+	mipi_dbi {
+		compatible = "zephyr,mipi-dbi-spi";
+		spi-dev = <&spi2>;
+		dc-gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
+		reset-gpios = <&gpio0 9 GPIO_ACTIVE_LOW>;
+		write-only;
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		st7789p3: st7789p3@0 {
+			compatible = "sitronix,st7789v";
+			mipi-max-frequency = <DT_FREQ_M(20)>;
+			mipi-mode = "MIPI_DBI_MODE_SPI_4WIRE";
+			reg = <0>;
+			width = <240>;
+			height = <136>;
+			x-offset = <40>;
+			y-offset = <52>;
+			vcom = <0x19>;
+			gctrl = <0x35>;
+			vrhs = <0x12>;
+			vdvs = <0x20>;
+			mdac = <0x70>;
+			lcm = <0x2c>;
+			pixel-format = <PANEL_PIXEL_FORMAT_RGB_565>;
+			gamma = <0x01>;
+			porch-param = [0c 0c 00 33 33];
+			cmd2en-param = [5a 69 02 01];
+			pwctrl1-param = [a4 a1];
+			pvgam-param = [d0 04 0d 11 13 2b 3f 54 4c 18 0d 0b 1f 23];
+			nvgam-param = [d0 04 0c 11 13 2c 3f 44 51 2f 1f 1f 20 23];
+			ram-param = [00 f0];
+			rgb-param = [cd 08 14];
+		};
+	};
+};
+
+&gpio0 {
+	status = "okay";
+};
+
+&gpio1 {
+	status = "okay";
+};
+
+&timer0 {
+	status = "okay";
+	prescaler = <10>;
+
+	counter0: counter {
+		status = "okay";
+	};
+};
+
+&pinctrl {
+	ledc0_default: ledc0_default {
+		group1 {
+			pinmux = <LEDC_CH0_GPIO14>;
+			output-enable;
+			bias-pull-up;
+		};
+	};
+
+	spim2_default: spim2_default {
+		group1 {
+			pinmux = <SPIM2_CSEL_GPIO10>,
+				 <SPIM2_SCLK_GPIO12>;
+		};
+
+		group2 {
+			pinmux = <SPIM2_MOSI_GPIO11>;
+			output-low;
+		};
+	};
+
+	i2c0_default: i2c0_default {
+		group1 {
+			pinmux = <I2C0_SDA_GPIO16>,
+				 <I2C0_SCL_GPIO17>;
+			bias-pull-up;
+			drive-open-drain;
+			output-high;
+		};
+	};
+};
+
+&ledc0 {
+	pinctrl-0 = <&ledc0_default>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	status = "okay";
+
+	channel0@0 {
+		reg = <0x0>;
+		timer = <0>;
+	};
+};
+
+&spi2 {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+	pinctrl-0 = <&spim2_default>;
+	pinctrl-names = "default";
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	ina219: ina219@40 {
+		compatible = "ti,ina219";
+		reg = <0x40>;
+		brng = <1>;
+		pg = <3>;
+		sadc = <3>;
+		badc = <3>;
+		shunt-milliohm = <100>;
+		lsb-microamp = <100>;
+		status = "okay";
+	};
+};
+
+&ipm0 {
+	status = "okay";
+};

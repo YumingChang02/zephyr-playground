@@ -183,11 +183,30 @@ mkdir -p <BOARD_DIR>/app/src
    ```
 
 ### Step 4: Identify Board Target Identifier
-Search Zephyr for the official board target name:
-```bash
-uv run west boards | grep -i <chip_or_board>
-```
-For example:
+In Zephyr Hardware Model v2 (Zephyr 3.7+), board targets use the format `<board>/<soc>/<cpu>` (qualifiers).
+
+By default, `west boards` only outputs the base board names (e.g. `esp32s3_geek`). To get the **full target identifiers** needed for `-b`:
+
+1. **List all valid target combinations (`-a` / `--all-targets`):**
+   ```bash
+   uv run west boards -a | grep -i <chip_or_board>
+   ```
+   *Example:*
+   ```bash
+   uv run west boards -a | grep -i esp32s3_geek
+   # Output:
+   # esp32s3_geek/esp32s3/procpu
+   # esp32s3_geek/esp32s3/appcpu
+   ```
+
+2. **Inspect target qualifiers for a specific board:**
+   ```bash
+   uv run west boards -a --board <board_name>
+   # or format with qualifiers:
+   uv run west boards -f "{name}: {qualifiers}" -n <board_name>
+   ```
+
+Common ESP32 board targets:
 - Waveshare ESP32-S3-GEEK: `esp32s3_geek/esp32s3/procpu`
 - ESP32-C6 DevKit: `esp32c6_devkitc/esp32c6/hpcore`
 
