@@ -158,6 +158,7 @@ static volatile int32_t  g_disp_current_ma = 0;
 static volatile bool wifi_connected = false;
 static volatile bool wifi_has_ip = false;
 static char wifi_ip_addr[16] = "0.0.0.0";
+static volatile int64_t last_dhcp_log = 0;
 
 typedef struct {
 	int fd;
@@ -1333,6 +1334,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		}
 		if (status->status == 0) {
 			wifi_connected = true;
+			last_dhcp_log = k_uptime_get();
 			printk("\n============================================================\n");
 			printk("[Wi-Fi] Association SUCCESSFUL!\n");
 #if defined(CONFIG_APP_WIFI_SSID)
@@ -1472,7 +1474,6 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	}
 
 	int server_fd = -1;
-	int64_t last_dhcp_log = 0;
 
 	/* Run active 2.4 GHz site survey scan to verify spectrum & target channel */
 	if (iface) {
@@ -1512,13 +1513,12 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 		/* If associated but waiting for DHCP IPv4 address */
 		if (!wifi_has_ip) {
-			if (wifi_connected && (now - last_dhcp_log > 8000)) {
+			if (wifi_connected && (now - last_dhcp_log > 10000)) {
 				last_dhcp_log = now;
 #if defined(CONFIG_APP_WIFI_SSID)
-				printk("[Wi-Fi] Associated with AP '%s'. Requesting DHCP lease renewal...\n",
+				printk("[Wi-Fi] Associated with AP '%s'. Waiting for DHCP IPv4 lease from router...\n",
 				       CONFIG_APP_WIFI_SSID);
 #endif
-				net_dhcpv4_restart(iface);
 			}
 			/* Clean up sockets if disconnected */
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
