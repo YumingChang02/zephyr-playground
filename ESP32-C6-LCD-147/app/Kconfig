@@ -15,6 +15,25 @@ config APP_WIFI_PSK
 	help
 	  WPA2/WPA3 pre-shared key (password) of the Wi-Fi network.
 
+config APP_STATIC_IP
+	string "Static IPv4 Address (Optional)"
+	default ""
+	help
+	  Optional static IPv4 address (e.g. "192.168.1.250").
+	  If empty, DHCPv4 is used automatically.
+
+config APP_STATIC_NETMASK
+	string "Static IPv4 Netmask"
+	default "255.255.255.0"
+	help
+	  Subnet mask for static IPv4 configuration.
+
+config APP_STATIC_GW
+	string "Static IPv4 Gateway"
+	default ""
+	help
+	  Default gateway IPv4 address (e.g. "192.168.1.1").
+
 endmenu
 
 menu "Sensor and Sampling Configuration"
