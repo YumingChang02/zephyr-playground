@@ -28,6 +28,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <time.h>
 
 #include "telemetry.h"
@@ -1149,6 +1151,12 @@ static uint32_t wifi_attempt_count = 0;
 static volatile bool wifi_connecting = false;
 static int64_t last_connect_start_ms = 0;
 
+static volatile bool g_target_ap_found = false;
+static volatile uint8_t g_target_channel = 0;
+static volatile enum wifi_security_type g_target_security = WIFI_SECURITY_TYPE_PSK;
+static K_SEM_DEFINE(wifi_scan_done_sem, 0, 1);
+static uint32_t scan_ap_count = 0;
+
 static void trigger_wifi_connect(void)
 {
 	struct net_if *iface = net_if_get_default();
@@ -1191,29 +1199,40 @@ static void trigger_wifi_connect(void)
 	const char *psk = CONFIG_APP_WIFI_PSK;
 	size_t psk_len = strlen(psk);
 
+	uint8_t target_chan = g_target_ap_found ? g_target_channel : WIFI_CHANNEL_ANY;
 	enum wifi_security_type sec_type = WIFI_SECURITY_TYPE_NONE;
 	const char *sec_str = "Open";
 
 	if (psk_len > 0) {
-#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
-		/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
-		if ((wifi_attempt_count % 2) == 0) {
-			sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
-			sec_str = "WPA3-SAE (Auto)";
+		if (g_target_ap_found) {
+			sec_type = g_target_security;
+			sec_str = wifi_security_txt(sec_type);
 		} else {
+#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
+			/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
+			if ((wifi_attempt_count % 2) == 0) {
+				sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
+				sec_str = "WPA3-SAE (Auto)";
+			} else {
+				sec_type = WIFI_SECURITY_TYPE_PSK;
+				sec_str = "WPA2-PSK";
+			}
+#else
 			sec_type = WIFI_SECURITY_TYPE_PSK;
 			sec_str = "WPA2-PSK";
-		}
-#else
-		sec_type = WIFI_SECURITY_TYPE_PSK;
-		sec_str = "WPA2-PSK";
 #endif
+		}
 	}
 
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
 	printk("[Wi-Fi] Connection Attempt #%u\n", wifi_attempt_count);
 	printk("[Wi-Fi]   SSID        : '%s'\n", ssid);
 	printk("[Wi-Fi]   Security    : %s\n", sec_str);
+	if (target_chan != WIFI_CHANNEL_ANY) {
+		printk("[Wi-Fi]   Target CH   : %u (Locked from Site Survey)\n", target_chan);
+	} else {
+		printk("[Wi-Fi]   Target CH   : All Channels (Scan)\n");
+	}
 	printk("[Wi-Fi]   Station MAC : %s\n", mac_str);
 	printk("[Wi-Fi]   Band        : 2.4 GHz (Wi-Fi 6 / 802.11b/g/n/ax)\n");
 	printk("[Wi-Fi] -----------------------------------------------------\n");
@@ -1223,7 +1242,7 @@ static void trigger_wifi_connect(void)
 		.ssid_length = strlen(ssid),
 		.psk = (const uint8_t *)psk,
 		.psk_length = psk_len,
-		.channel = WIFI_CHANNEL_ANY,
+		.channel = target_chan,
 		.security = sec_type,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
 		.mfp = WIFI_MFP_OPTIONAL,
@@ -1246,10 +1265,65 @@ static void trigger_wifi_connect(void)
 #endif
 }
 
+static bool str_case_eq(const char *s1, const char *s2)
+{
+	if (!s1 || !s2) return false;
+	while (*s1 && *s2) {
+		if (tolower((unsigned char)*s1) != tolower((unsigned char)*s2)) {
+			return false;
+		}
+		s1++;
+		s2++;
+	}
+	return (*s1 == '\0' && *s2 == '\0');
+}
+
 static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
                                     uint64_t mgmt_event, struct net_if *iface)
 {
 	switch (mgmt_event) {
+	case NET_EVENT_WIFI_SCAN_RESULT: {
+		const struct wifi_scan_result *entry = (const struct wifi_scan_result *)cb->info;
+		if (!entry || entry->ssid_length == 0) {
+			break;
+		}
+		scan_ap_count++;
+		char s_ssid[WIFI_SSID_MAX_LEN + 1];
+		size_t slen = entry->ssid_length < WIFI_SSID_MAX_LEN ? entry->ssid_length : WIFI_SSID_MAX_LEN;
+		memcpy(s_ssid, entry->ssid, slen);
+		s_ssid[slen] = '\0';
+
+		printk("[Wi-Fi Scan]   #%02u: '%s' | Ch %2u | RSSI %3d dBm | %s\n",
+		       scan_ap_count, s_ssid, entry->channel, entry->rssi,
+		       wifi_security_txt(entry->security));
+
+#if defined(CONFIG_APP_WIFI_SSID)
+		if (strcmp(s_ssid, CONFIG_APP_WIFI_SSID) == 0) {
+			g_target_ap_found = true;
+			g_target_channel = entry->channel;
+			g_target_security = entry->security;
+			printk("[Wi-Fi Scan]   >>> MATCH FOUND! Targeted AP '%s' on Channel %u\n",
+			       s_ssid, entry->channel);
+		} else if (str_case_eq(s_ssid, CONFIG_APP_WIFI_SSID)) {
+			printk("[Wi-Fi Scan]   >>> WARNING: CASE MISMATCH! Found '%s', but config has '%s'!\n",
+			       s_ssid, CONFIG_APP_WIFI_SSID);
+		}
+#endif
+		break;
+	}
+	case NET_EVENT_WIFI_SCAN_DONE: {
+		printk("[Wi-Fi Scan] -----------------------------------------------------\n");
+		printk("[Wi-Fi Scan] Survey complete. Total 2.4 GHz APs found: %u\n", scan_ap_count);
+#if defined(CONFIG_APP_WIFI_SSID)
+		if (!g_target_ap_found) {
+			printk("[Wi-Fi Scan] NOTICE: Target SSID '%s' was NOT detected.\n", CONFIG_APP_WIFI_SSID);
+			printk("[Wi-Fi Scan] Note: If using an iPhone/Android hotspot, ensure 'Maximize Compatibility' is enabled and the hotspot screen is active.\n");
+		}
+#endif
+		printk("[Wi-Fi Scan] -----------------------------------------------------\n");
+		k_sem_give(&wifi_scan_done_sem);
+		break;
+	}
 	case NET_EVENT_WIFI_CONNECT_RESULT: {
 		wifi_connecting = false;
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
@@ -1365,8 +1439,13 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	printk("[Thread 5: HTTP Server & Wi-Fi] Started (Priority %d)\n", PRIORITY_WIFI_HTTP);
 
+	struct net_if *iface = net_if_get_default();
+
 	net_mgmt_init_event_callback(&wifi_mgmt_cb, wifi_mgmt_event_handler,
-	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
+	                             NET_EVENT_WIFI_CONNECT_RESULT |
+	                             NET_EVENT_WIFI_DISCONNECT_RESULT |
+	                             NET_EVENT_WIFI_SCAN_RESULT |
+	                             NET_EVENT_WIFI_SCAN_DONE);
 	net_mgmt_add_event_callback(&wifi_mgmt_cb);
 
 	net_mgmt_init_event_callback(&ipv4_mgmt_cb, wifi_mgmt_event_handler,
@@ -1379,8 +1458,21 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	}
 
 	int server_fd = -1;
-	int64_t last_reconnect_attempt = 0;
 	int64_t last_dhcp_log = 0;
+
+	/* Run active 2.4 GHz site survey scan to verify spectrum & target channel */
+	if (iface) {
+		printk("\n[Wi-Fi Scan] Running 2.4 GHz site survey to locate '%s'...\n", CONFIG_APP_WIFI_SSID);
+		scan_ap_count = 0;
+		struct wifi_scan_params scan_params = {
+			.scan_type = WIFI_SCAN_TYPE_ACTIVE,
+			.bands = WIFI_FREQ_BAND_2_4_GHZ,
+		};
+		int s_rc = net_mgmt(NET_REQUEST_WIFI_SCAN, iface, &scan_params, sizeof(scan_params));
+		if (s_rc == 0) {
+			k_sem_take(&wifi_scan_done_sem, K_SECONDS(5));
+		}
+	}
 
 	/* Trigger initial connection attempt */
 	trigger_wifi_connect();
