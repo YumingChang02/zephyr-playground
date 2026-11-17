@@ -291,16 +291,23 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 				g_prof_elapsed_sec = 0;
 				target_duty = pL;
 			} else {
-				/* Compute wall-clock aligned time relative to 00:00:00 */
-				int64_t ms_since_sync = now_ms - g_time_sync_uptime_ms;
-				if (ms_since_sync < 0) {
-					ms_since_sync = 0;
+				/* Compute wall-clock aligned time relative to 00:00:00 if synced, else uptime */
+				uint32_t cur_sec_of_day;
+				uint32_t cur_sub_ms;
+				if (g_time_synced) {
+					int64_t ms_since_sync = now_ms - g_time_sync_uptime_ms;
+					if (ms_since_sync < 0) {
+						ms_since_sync = 0;
+					}
+					uint64_t total_day_ms = (uint64_t)g_time_sec_of_day * 1000ULL +
+					                        (uint64_t)g_time_ms_part +
+					                        (uint64_t)ms_since_sync;
+					cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
+					cur_sub_ms = (uint32_t)(total_day_ms % 1000ULL);
+				} else {
+					cur_sec_of_day = (uint32_t)(now_ms / 1000ULL);
+					cur_sub_ms = (uint32_t)(now_ms % 1000ULL);
 				}
-				uint64_t total_day_ms = (uint64_t)g_time_sec_of_day * 1000ULL +
-				                        (uint64_t)g_time_ms_part +
-				                        (uint64_t)ms_since_sync;
-				uint32_t cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
-				uint32_t cur_sub_ms = (uint32_t)(total_day_ms % 1000ULL);
 
 				/* Loop position strictly aligned to 00:00:00 */
 				uint32_t elapsed_sec = cur_sec_of_day % total;
@@ -640,7 +647,11 @@ static void render_time_panel(uint16_t x, uint16_t y,
 
 	char date_str[12];
 	char time_str[12];
-	snprintf(date_str, sizeof(date_str), "%02u/%02u", month, day);
+	if (!is_synced || month == 0) {
+		snprintf(date_str, sizeof(date_str), "--/--");
+	} else {
+		snprintf(date_str, sizeof(date_str), "%02u/%02u", month, day);
+	}
 	snprintf(time_str, sizeof(time_str), "%02u:%02u:%02u", hour, min, sec);
 
 	/* Top Sync Indicator (at y = 16) */
@@ -719,14 +730,15 @@ static void display_thread_fn(void *arg1, void *arg2, void *arg3)
 		return;
 	}
 
+	/* Flush GRAM to solid black BEFORE enabling backlight to prevent random pixel snow */
+	clear_screen_black();
+	display_blanking_off(display_dev);
+
 	if (bl_spec.port && device_is_ready(bl_spec.port)) {
 		gpio_pin_configure_dt(&bl_spec, GPIO_OUTPUT_ACTIVE);
 		gpio_pin_set_dt(&bl_spec, 1);
 		printk("[APP_CPU] LCD Backlight enabled on GPIO %d\n", bl_spec.pin);
 	}
-
-	display_blanking_off(display_dev);
-	clear_screen_black();
 	printk("[APP_CPU] Display engine initialized (Stacked 3-bar gauge + Right Time Widget)\n");
 
 	/* Bar colors (RGB565) */
@@ -765,17 +777,31 @@ static void display_thread_fn(void *arg1, void *arg2, void *arg3)
 
 		/* Compute continuous local wall-clock time so screen clock never freezes */
 		int64_t now_ms = k_uptime_get();
-		int64_t ms_since_sync = now_ms - g_time_sync_uptime_ms;
-		if (ms_since_sync < 0) {
-			ms_since_sync = 0;
+		uint8_t disp_hour;
+		uint8_t disp_min;
+		uint8_t disp_sec;
+		uint32_t cur_sec_of_day;
+
+		if (g_time_synced) {
+			int64_t ms_since_sync = now_ms - g_time_sync_uptime_ms;
+			if (ms_since_sync < 0) {
+				ms_since_sync = 0;
+			}
+			uint64_t total_day_ms = (uint64_t)g_time_sec_of_day * 1000ULL +
+			                        (uint64_t)g_time_ms_part +
+			                        (uint64_t)ms_since_sync;
+			cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
+			disp_hour = (uint8_t)((cur_sec_of_day / 3600U) % 24U);
+			disp_min  = (uint8_t)((cur_sec_of_day % 3600U) / 60U);
+			disp_sec  = (uint8_t)(cur_sec_of_day % 60U);
+		} else {
+			/* Before NTP sync, show elapsed uptime HH:MM:SS */
+			uint32_t uptime_sec = (uint32_t)(now_ms / 1000ULL);
+			cur_sec_of_day = uptime_sec;
+			disp_hour = (uint8_t)((uptime_sec / 3600U) % 24U);
+			disp_min  = (uint8_t)((uptime_sec % 3600U) / 60U);
+			disp_sec  = (uint8_t)(uptime_sec % 60U);
 		}
-		uint64_t total_day_ms = (uint64_t)g_time_sec_of_day * 1000ULL +
-		                        (uint64_t)g_time_ms_part +
-		                        (uint64_t)ms_since_sync;
-		uint32_t cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
-		uint8_t disp_hour = (uint8_t)((cur_sec_of_day / 3600U) % 24U);
-		uint8_t disp_min  = (uint8_t)((cur_sec_of_day % 3600U) / 60U);
-		uint8_t disp_sec  = (uint8_t)(cur_sec_of_day % 60U);
 
 		/* Compute active profile stage and countdown of remaining seconds in stage */
 		uint32_t t1 = g_prof_cfg.t_low_sec;

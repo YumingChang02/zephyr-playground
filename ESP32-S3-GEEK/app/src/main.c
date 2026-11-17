@@ -148,8 +148,10 @@ static K_SEM_DEFINE(ntp_trigger_sem, 0, 1);
 
 /* Wi-Fi & Network State */
 static volatile bool wifi_connected = false;
+static volatile bool wifi_connecting = false;
 static volatile bool wifi_has_ip = false;
 static char assigned_ipv4_str[NET_IPV4_ADDR_LEN] = "0.0.0.0";
+static int64_t last_connect_start_ms = 0;
 static uint32_t wifi_attempt_count = 0;
 static struct net_mgmt_event_callback wifi_cb;
 static struct net_mgmt_event_callback ipv4_cb;
@@ -184,16 +186,23 @@ static void sdcard_flush_sync(void)
 
 static void get_formatted_time(char *iso_buf, size_t iso_len, char *date_buf, size_t date_len)
 {
-	int64_t now_sec;
 	k_spinlock_key_t key = k_spin_lock(&time_spinlock);
-	if (ntp_synced) {
-		now_sec = ntp_epoch_sec + (k_uptime_get() - ntp_sync_uptime) / 1000;
-	} else {
-		/* Fallback starting at 2026-01-01 00:00:00 UTC before NTP sync */
-		now_sec = 1767225600LL + (k_uptime_get() / 1000);
-	}
+	bool synced = ntp_synced;
+	int64_t epoch = ntp_epoch_sec;
+	int64_t uptime_ref = ntp_sync_uptime;
 	k_spin_unlock(&time_spinlock, key);
 
+	if (!synced) {
+		if (iso_buf && iso_len > 0) {
+			snprintf(iso_buf, iso_len, "NTP_PENDING");
+		}
+		if (date_buf && date_len > 0) {
+			date_buf[0] = '\0';
+		}
+		return;
+	}
+
+	int64_t now_sec = epoch + (k_uptime_get() - uptime_ref) / 1000;
 	time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
 	struct tm tm_info;
 	gmtime_r(&t, &tm_info);
@@ -227,38 +236,46 @@ static void sync_time_to_app_cpu(int64_t now_ms, bool force)
 		return;
 	}
 
-	int64_t now_sec;
+	int64_t now_sec = 0;
 	int64_t ms_from_sync = 0;
 	k_spinlock_key_t key = k_spin_lock(&time_spinlock);
-	if (ntp_synced) {
+	bool is_synced = ntp_synced;
+	if (is_synced) {
 		ms_from_sync = now_ms - ntp_sync_uptime;
 		now_sec = ntp_epoch_sec + (ms_from_sync / 1000);
-	} else {
-		ms_from_sync = now_ms;
-		now_sec = 1767225600LL + (now_ms / 1000);
 	}
-	bool is_synced = ntp_synced;
 	k_spin_unlock(&time_spinlock, key);
 
-	time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
-	struct tm tm_val;
-	gmtime_r(&t, &tm_val);
+	ipm_time_sync_t t_sync;
+	if (is_synced) {
+		time_t t = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
+		struct tm tm_val;
+		gmtime_r(&t, &tm_val);
 
-	uint32_t sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
-	                      (uint32_t)tm_val.tm_min * 60U +
-	                      (uint32_t)tm_val.tm_sec;
-	uint16_t ms_part = (uint16_t)(((ms_from_sync % 1000LL) + 1000LL) % 1000LL);
+		uint32_t sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
+		                      (uint32_t)tm_val.tm_min * 60U +
+		                      (uint32_t)tm_val.tm_sec;
+		uint16_t ms_part = (uint16_t)(((ms_from_sync % 1000LL) + 1000LL) % 1000LL);
 
-	ipm_time_sync_t t_sync = {
-		.month = (uint8_t)(tm_val.tm_mon + 1),
-		.day = (uint8_t)tm_val.tm_mday,
-		.hour = (uint8_t)tm_val.tm_hour,
-		.min = (uint8_t)tm_val.tm_min,
-		.sec = (uint8_t)tm_val.tm_sec,
-		.synced = is_synced ? 1 : 0,
-		.ms_part = ms_part,
-		.sec_of_day = sec_of_day,
-	};
+		t_sync.month = (uint8_t)(tm_val.tm_mon + 1);
+		t_sync.day = (uint8_t)tm_val.tm_mday;
+		t_sync.hour = (uint8_t)tm_val.tm_hour;
+		t_sync.min = (uint8_t)tm_val.tm_min;
+		t_sync.sec = (uint8_t)tm_val.tm_sec;
+		t_sync.synced = 1;
+		t_sync.ms_part = ms_part;
+		t_sync.sec_of_day = sec_of_day;
+	} else {
+		uint32_t uptime_sec = (uint32_t)(now_ms / 1000ULL);
+		t_sync.month = 0;
+		t_sync.day = 0;
+		t_sync.hour = (uint8_t)((uptime_sec / 3600U) % 24U);
+		t_sync.min = (uint8_t)((uptime_sec % 3600U) / 60U);
+		t_sync.sec = (uint8_t)(uptime_sec % 60U);
+		t_sync.synced = 0;
+		t_sync.ms_part = (uint16_t)(now_ms % 1000ULL);
+		t_sync.sec_of_day = uptime_sec % 86400U;
+	}
 
 	ipm_send(ipm_dev, 0, IPM_CHANNEL_TIME_SYNC, &t_sync, sizeof(t_sync));
 }
@@ -306,8 +323,10 @@ static void ipm_receive_callback(const struct device *dev, void *user_data,
 		get_formatted_time(full_pkt.iso_time, sizeof(full_pkt.iso_time),
 		                   full_pkt.date_str, sizeof(full_pkt.date_str));
 
-		/* Enqueue to SD Card logger */
-		k_msgq_put(&csv_msgq, &full_pkt, K_NO_WAIT);
+		/* Enqueue to SD Card logger only after real wall-clock time is locked by NTP */
+		if (ntp_synced) {
+			k_msgq_put(&csv_msgq, &full_pkt, K_NO_WAIT);
+		}
 
 		/* Update latest telemetry for SSE clients */
 		k_spinlock_key_t key = k_spin_lock(&telemetry_spinlock);
@@ -703,11 +722,9 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			}
 		}
 
-		char day_str[24];
-		if (strlen(packet.date_str) > 0) {
-			strncpy(day_str, packet.date_str, sizeof(day_str));
-		} else {
-			get_formatted_time(NULL, 0, day_str, sizeof(day_str));
+		const char *day_str = packet.date_str;
+		if (strlen(day_str) == 0) {
+			continue;
 		}
 
 		/* Daily file rotation: If day changed or first run */
@@ -984,6 +1001,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 {
 	switch (mgmt_event) {
 	case NET_EVENT_WIFI_CONNECT_RESULT: {
+		wifi_connecting = false;
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
 		if (!status) {
 			printk("[Wi-Fi] Event: CONNECT_RESULT (no status data)\n");
@@ -1018,6 +1036,7 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 	}
 	case NET_EVENT_WIFI_DISCONNECT_RESULT: {
 		wifi_connected = false;
+		wifi_connecting = false;
 		wifi_has_ip = false;
 		assigned_ipv4_str[0] = '\0';
 		const struct wifi_status *status = (const struct wifi_status *)cb->info;
@@ -1088,7 +1107,26 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 static void trigger_wifi_connect(void)
 {
 	struct net_if *iface = net_if_get_default();
+	if (!iface) {
+		printk("[Wi-Fi] ERROR: No default network interface found!\n");
+		return;
+	}
+
+	if (wifi_connected) {
+		return;
+	}
+
+	/* If a previous connection was in progress, issue DISCONNECT to cleanly reset driver state */
+	if (wifi_connecting) {
+		printk("[Wi-Fi] Resetting Wi-Fi driver state before initiating fresh connect...\n");
+		net_mgmt(NET_REQUEST_WIFI_DISCONNECT, iface, NULL, 0);
+		k_msleep(250);
+		wifi_connecting = false;
+	}
+
 	wifi_attempt_count++;
+	last_connect_start_ms = k_uptime_get();
+	wifi_connecting = true;
 
 	char mac_str[18] = "Unknown MAC";
 	struct net_linkaddr *link_addr = net_if_get_link_addr(iface);
@@ -1098,7 +1136,25 @@ static void trigger_wifi_connect(void)
 		         link_addr->addr[3], link_addr->addr[4], link_addr->addr[5]);
 	}
 
-	const char *sec_str = (strlen(CONFIG_APP_WIFI_PSK) > 0) ? "WPA2-PSK" : "Open";
+	enum wifi_security_type sec_type = WIFI_SECURITY_TYPE_NONE;
+	const char *sec_str = "Open";
+
+	if (strlen(CONFIG_APP_WIFI_PSK) > 0) {
+#if defined(CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE)
+		/* Alternate between WPA2-PSK (odd attempts) and WPA3-SAE (even attempts) to handle pure WPA3 APs */
+		if ((wifi_attempt_count % 2) == 0) {
+			sec_type = WIFI_SECURITY_TYPE_SAE_AUTO;
+			sec_str = "WPA3-SAE (Auto)";
+		} else {
+			sec_type = WIFI_SECURITY_TYPE_PSK;
+			sec_str = "WPA2-PSK";
+		}
+#else
+		sec_type = WIFI_SECURITY_TYPE_PSK;
+		sec_str = "WPA2-PSK";
+#endif
+	}
+
 	printk("\n[Wi-Fi] -----------------------------------------------------\n");
 	printk("[Wi-Fi] Initiating connection attempt #%u...\n", wifi_attempt_count);
 	printk("[Wi-Fi]   Target SSID : %s\n", CONFIG_APP_WIFI_SSID);
@@ -1113,13 +1169,14 @@ static void trigger_wifi_connect(void)
 		.psk = CONFIG_APP_WIFI_PSK,
 		.psk_length = strlen(CONFIG_APP_WIFI_PSK),
 		.channel = WIFI_CHANNEL_ANY,
-		.security = (strlen(CONFIG_APP_WIFI_PSK) > 0) ? WIFI_SECURITY_TYPE_PSK : WIFI_SECURITY_TYPE_NONE,
+		.security = sec_type,
 		.band = WIFI_FREQ_BAND_2_4_GHZ,
 		.mfp = WIFI_MFP_OPTIONAL,
 	};
 
 	int ret = net_mgmt(NET_REQUEST_WIFI_CONNECT, iface, &params, sizeof(params));
 	if (ret) {
+		wifi_connecting = false;
 		printk("[Wi-Fi] ERROR: Connect request failed immediately (err: %d)\n", ret);
 	} else {
 		printk("[Wi-Fi] Connect request queued. Waiting for association callback...\n");
@@ -1154,7 +1211,6 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	                             NET_EVENT_IPV4_ADDR_ADD | NET_EVENT_IPV4_ADDR_DEL);
 	net_mgmt_add_event_callback(&ipv4_cb);
 
-	int64_t last_reconnect_attempt = 0;
 	int64_t last_dhcp_log = 0;
 	int server_fd = -1;
 	sse_client_t sse_clients[MAX_SSE_CLIENTS];
@@ -1163,12 +1219,27 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 		sse_clients[i].last_sent_id = 0;
 	}
 
+	/* Trigger initial connection attempt */
+	trigger_wifi_connect();
+
 	while (1) {
 		int64_t now = k_uptime_get();
 		sync_time_to_app_cpu(now, false);
-		if (!wifi_connected && (now - last_reconnect_attempt > 10000)) {
-			last_reconnect_attempt = now;
-			trigger_wifi_connect();
+
+		/* Auto-reconnect supervisor: non-blocking, guarded against overlapping connection attempts */
+		if (!wifi_connected) {
+			if (wifi_connecting) {
+				/* Watchdog: If in-flight connection has been waiting > 20s without driver callback, reset and retry */
+				if (now - last_connect_start_ms > 20000) {
+					printk("[Wi-Fi] Connection attempt timed out (20s). Retrying with clean state...\n");
+					trigger_wifi_connect();
+				}
+			} else {
+				/* If disconnected and not connecting, wait 10s between attempts */
+				if (now - last_connect_start_ms > 10000) {
+					trigger_wifi_connect();
+				}
+			}
 		}
 
 		if (!wifi_has_ip) {
