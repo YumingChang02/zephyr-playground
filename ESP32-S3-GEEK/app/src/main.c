@@ -1031,6 +1031,9 @@ static bool apply_static_ip_if_configured(struct net_if *iface)
 		/* Add unicast static IP */
 		struct net_if_addr *if_addr = net_if_ipv4_addr_add(iface, &ip_addr, NET_ADDR_MANUAL, 0);
 		if (!if_addr) {
+			if_addr = net_if_ipv4_addr_lookup(&ip_addr, &iface);
+		}
+		if (!if_addr) {
 			printk("[Wi-Fi] ERROR: Failed to assign static IP '%s' to network interface!\n",
 			       CONFIG_APP_STATIC_IP);
 			return false;
@@ -1053,7 +1056,9 @@ static bool apply_static_ip_if_configured(struct net_if *iface)
 		dns_resolve_reconfigure(dns_resolve_get_default(), dns_servers, NULL, DNS_SOURCE_MANUAL);
 #endif
 
-		printk("[Wi-Fi] Assigned static IPv4: %s (Netmask: %s)\n", CONFIG_APP_STATIC_IP, nm_str);
+		snprintk(assigned_ipv4_str, sizeof(assigned_ipv4_str), "%s", CONFIG_APP_STATIC_IP);
+		wifi_has_ip = true;
+		printk("[Wi-Fi] Static IPv4 configured: %s (Netmask: %s)\n", CONFIG_APP_STATIC_IP, nm_str);
 		return true;
 	}
 #endif
@@ -1074,11 +1079,18 @@ static void wifi_mgmt_event_handler(struct net_mgmt_event_callback *cb,
 		if (status->status == 0) {
 			wifi_connected = true;
 			printk("\n============================================================\n");
-			printk("[Wi-Fi] Connected successfully to '%s'\n", CONFIG_APP_WIFI_SSID);
+			printk("[Wi-Fi] Connected successfully to '%s'!\n", CONFIG_APP_WIFI_SSID);
 			printk("============================================================\n");
 
 			if (apply_static_ip_if_configured(iface)) {
-				printk("[Wi-Fi] Static IPv4 configured: %s\n", CONFIG_APP_STATIC_IP);
+				printk("  [IP Address]   : %s\n", assigned_ipv4_str);
+				printk("  [Web URL]      : http://%s/\n", assigned_ipv4_str);
+				printk("  [SSE Stream]   : http://%s/events\n", assigned_ipv4_str);
+				printk("============================================================\n\n");
+				k_sem_give(&ntp_trigger_sem);
+			} else {
+				printk("[Wi-Fi] Link UP -> Requesting DHCP IPv4 lease from router...\n");
+				net_dhcpv4_start(iface);
 			}
 		} else {
 			wifi_connected = false;
@@ -1257,6 +1269,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 	printk("[Thread 2: Wi-Fi & Web Server] Started (Priority %d)\n", PRIORITY_WIFI);
 
+	struct net_if *iface = net_if_get_default();
+
 	net_mgmt_init_event_callback(&wifi_cb, wifi_mgmt_event_handler,
 	                             NET_EVENT_WIFI_CONNECT_RESULT | NET_EVENT_WIFI_DISCONNECT_RESULT);
 	net_mgmt_add_event_callback(&wifi_cb);
@@ -1272,6 +1286,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 	for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 		sse_clients[i].fd = -1;
 		sse_clients[i].last_sent_id = 0;
+	}
+
+	/* Pre-configure static IP on interface so driver adopts it immediately */
+	if (iface) {
+		apply_static_ip_if_configured(iface);
 	}
 
 	int64_t last_reconnect_attempt = k_uptime_get();

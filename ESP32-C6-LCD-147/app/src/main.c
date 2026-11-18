@@ -307,8 +307,9 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 
 		g_total_pulses += current_pulses;
 
-		/* Compute second of day for 00:00:00 alignment (or relative uptime if pending) */
+		/* Compute second of day and sub-millisecond offset */
 		uint32_t cur_sec_of_day;
+		uint32_t cur_sub_ms;
 		k_spinlock_key_t tkey = k_spin_lock(&time_spinlock);
 		bool synced = ntp_synced;
 		int64_t epoch = ntp_epoch_sec;
@@ -316,16 +317,12 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		k_spin_unlock(&time_spinlock, tkey);
 
 		if (synced) {
-			int64_t now_sec = epoch + (current_time_ms - uptime_ref) / 1000;
-			time_t t_local = (time_t)(now_sec + CONFIG_APP_TIMEZONE_OFFSET_SEC);
-			struct tm tm_val;
-			gmtime_r(&t_local, &tm_val);
-			cur_sec_of_day = (uint32_t)tm_val.tm_hour * 3600U +
-			                 (uint32_t)tm_val.tm_min * 60U +
-			                 (uint32_t)tm_val.tm_sec;
+			int64_t total_day_ms = (epoch * 1000ULL + (current_time_ms - uptime_ref) + (int64_t)CONFIG_APP_TIMEZONE_OFFSET_SEC * 1000ULL);
+			cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
+			cur_sub_ms = (uint32_t)(total_day_ms % 1000ULL);
 		} else {
-			/* Before NTP lock, cycle profile from system boot uptime */
-			cur_sec_of_day = (uint32_t)(current_time_ms / 1000);
+			cur_sec_of_day = (uint32_t)(current_time_ms / 1000ULL);
+			cur_sub_ms = (uint32_t)(current_time_ms % 1000ULL);
 		}
 
 		/* Read current profile configuration */
@@ -340,6 +337,8 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		uint32_t t2 = cfg.t_up_sec;
 		uint32_t t3 = cfg.t_high_sec;
 		uint32_t t4 = cfg.t_drop_sec;
+		uint32_t pL = cfg.p_low_pct;
+		uint32_t pH = cfg.p_high_pct;
 		uint32_t total = t1 + t2 + t3 + t4;
 		g_prof_total_sec = (uint16_t)total;
 
@@ -349,25 +348,33 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 
 			if (phase_sec < t1) {
 				stage = PROFILE_STAGE_LOW;
-				target_pwm = cfg.p_low_pct;
+				target_pwm = pL;
 			} else if (phase_sec < t1 + t2) {
 				stage = PROFILE_STAGE_UP;
-				uint32_t dt = phase_sec - t1;
-				if (t2 > 0) {
-					target_pwm = cfg.p_low_pct + ((cfg.p_high_pct - cfg.p_low_pct) * dt) / t2;
+				uint32_t ramp_total_ms = t2 * 1000U;
+				uint32_t dt_ms = (phase_sec - t1) * 1000U + cur_sub_ms;
+				if (dt_ms > ramp_total_ms) {
+					dt_ms = ramp_total_ms;
+				}
+				if (pH >= pL) {
+					target_pwm = pL + (ramp_total_ms > 0 ? ((pH - pL) * dt_ms) / ramp_total_ms : (pH - pL));
 				} else {
-					target_pwm = cfg.p_high_pct;
+					target_pwm = pL - (ramp_total_ms > 0 ? ((pL - pH) * dt_ms) / ramp_total_ms : (pL - pH));
 				}
 			} else if (phase_sec < t1 + t2 + t3) {
 				stage = PROFILE_STAGE_HIGH;
-				target_pwm = cfg.p_high_pct;
+				target_pwm = pH;
 			} else {
 				stage = PROFILE_STAGE_DROP;
-				uint32_t dt = phase_sec - (t1 + t2 + t3);
-				if (t4 > 0) {
-					target_pwm = cfg.p_high_pct - ((cfg.p_high_pct - cfg.p_low_pct) * dt) / t4;
+				uint32_t drop_total_ms = t4 * 1000U;
+				uint32_t dt_ms = (phase_sec - (t1 + t2 + t3)) * 1000U + cur_sub_ms;
+				if (dt_ms > drop_total_ms) {
+					dt_ms = drop_total_ms;
+				}
+				if (pH >= pL) {
+					target_pwm = pH - (drop_total_ms > 0 ? ((pH - pL) * dt_ms) / drop_total_ms : (pH - pL));
 				} else {
-					target_pwm = cfg.p_low_pct;
+					target_pwm = pH + (drop_total_ms > 0 ? ((pL - pH) * dt_ms) / drop_total_ms : (pL - pH));
 				}
 			}
 		} else if (cfg.action == PWM_ACTION_MANUAL_PWM) {
