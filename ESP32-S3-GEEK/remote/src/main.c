@@ -390,8 +390,8 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 
 		if ((sample_loop_cnt % 6) == 0 && fg_spec.port && device_is_ready(fg_spec.port)) {
 			int current_level = gpio_pin_get_dt(&fg_spec);
-			printk("[APP_CPU] Motor: PWM %u%% | Pulses: %u (total: %llu) | Raw: %u | Smoothed RPM: %u | FG line: %d\n",
-			       duty_cycle_pct, delta_pulses, (unsigned long long)g_total_pulses, raw_rpm, rpm, current_level);
+			printk("[APP_CPU] Motor: PWM %u%% | Pulses: %u in %u ms (total: %llu) | Raw: %u | Smoothed RPM: %u | FG line: %d\n",
+			       duty_cycle_pct, delta_pulses, (uint32_t)elapsed_ms, (unsigned long long)g_total_pulses, raw_rpm, rpm, current_level);
 		}
 
 		motor_speed_sample_t sample = {
