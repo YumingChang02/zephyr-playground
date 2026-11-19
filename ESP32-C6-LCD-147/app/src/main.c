@@ -170,6 +170,7 @@ static sse_client_t sse_clients[MAX_SSE_CLIENTS];
 static K_SEM_DEFINE(download_start_sem, 0, 1);
 static volatile int g_download_client_fd = -1;
 static volatile bool g_download_in_progress = false;
+static char g_download_target_file[64] = "";
 
 /* SD Card & FAT32 State */
 static struct fs_mount_t mp = {
@@ -403,10 +404,21 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		/* Calculate Motor RPM */
 		uint32_t raw_rpm = (uint32_t)(((uint64_t)current_pulses * 60000ULL) /
 		                              (CONFIG_APP_MOTOR_PULSES_PER_REV * (uint64_t)elapsed_ms));
-		if (ema_rpm == 0) {
+		if (current_pulses == 0) {
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			ema_rpm = (ema_rpm * (CONFIG_APP_SAMPLE_RATE_HZ - 1)) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			ema_rpm = 0;
+#endif
+			if (ema_rpm < 30) ema_rpm = 0;
+		} else if (ema_rpm == 0) {
 			ema_rpm = raw_rpm;
 		} else {
-			ema_rpm = (ema_rpm * 3 + raw_rpm) / 4;
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			ema_rpm = (ema_rpm * (CONFIG_APP_SAMPLE_RATE_HZ - 1) + raw_rpm) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			ema_rpm = raw_rpm;
+#endif
 		}
 		g_disp_rpm = ema_rpm;
 
@@ -1076,6 +1088,15 @@ static const char INDEX_HTML[] =
 "#tip{position:fixed;display:none;background:#222;border:1px solid #555;padding:6px 10px;border-radius:4px;font-size:0.75rem;color:#fff;pointer-events:none;z-index:99}"
 "</style></head><body>"
 "<h1><span>Waveshare ESP32-C6 Motor Engine</span><span id=\"conn\" class=\"badge warn\">Connecting...</span></h1>"
+"<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#1e1e1e;padding:8px 12px;border-radius:6px;border:1px solid #333;margin-bottom:12px\">"
+"<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F4BE; CSV Log:</span>"
+"<select id=\"csv-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Loading logs...</option></select>"
+"<button type=\"button\" onclick=\"downloadSelectedCsv()\" style=\"padding:3px 10px;background:#0288d1;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x1F4E5; Download</button>"
+"<span style=\"border-left:1px solid #444;height:18px;margin:0 4px\"></span>"
+"<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F5D1;&#xFE0F; Cleanup:</span>"
+"<select id=\"clean-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Select log...</option></select>"
+"<button type=\"button\" onclick=\"deleteSelectedCsv()\" style=\"padding:3px 10px;background:#d32f2f;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x2716; Delete</button>"
+"</div>"
 "<div class=\"grid\">"
 "<div class=\"card\"><div class=\"card-title\">Motor Speed</div><div class=\"card-val\"><span id=\"v-rpm\">0</span> <span class=\"unit\">RPM</span></div></div>"
 "<div class=\"card\"><div class=\"card-title\">Target PWM</div><div class=\"card-val\"><span id=\"v-pwm\">0</span> <span class=\"unit\">%</span></div></div>"
@@ -1200,6 +1221,33 @@ static const char INDEX_HTML[] =
 "render();"
 "}catch(err){}"
 "};"
+"function loadCsvList(){"
+"fetch('/api/csv/list').then(r=>r.json()).then(files=>{"
+"const dl=document.getElementById('csv-select'),cl=document.getElementById('clean-select');"
+"if(!dl||!cl)return;"
+"dl.innerHTML='';cl.innerHTML='<option value=\"\">Select log...</option>';"
+"if(!files||files.length===0){dl.innerHTML='<option value=\"\">No logs found</option>';return;}"
+"files.forEach(f=>{"
+"const o1=document.createElement('option');o1.value=f.name;"
+"o1.textContent=f.name+' ('+Math.round(f.size/1024)+' KB)'+(f.is_today?' [Today]':'');"
+"if(f.is_today)o1.selected=true;dl.appendChild(o1);"
+"const o2=document.createElement('option');o2.value=f.name;"
+"o2.textContent=f.name+(f.is_today?' [Today: Recreate]':'');cl.appendChild(o2);"
+"});"
+"}).catch(e=>{});"
+"}"
+"function downloadSelectedCsv(){"
+"const s=document.getElementById('csv-select');if(!s||!s.value)return;"
+"window.location.href='/download?file='+encodeURIComponent(s.value);"
+"}"
+"function deleteSelectedCsv(){"
+"const s=document.getElementById('clean-select');if(!s||!s.value){alert('Select a log file to delete');return;}"
+"const fn=s.value;"
+"if(!confirm('Delete '+fn+'?\\n(If today\\'s log, it will be cleared & recreated)'))return;"
+"fetch('/api/csv/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'file='+encodeURIComponent(fn)})"
+".then(r=>r.json()).then(j=>{alert('File '+(j.recreated?'cleared & recreated':'deleted'));loadCsvList();}).catch(e=>{alert('Error deleting');});"
+"}"
+"loadCsvList();"
 "</script></body></html>";
 
 static int get_query_param_int(const char *req, const char *param, int default_val)
@@ -1210,6 +1258,23 @@ static int get_query_param_int(const char *req, const char *param, int default_v
 	if (!p) return default_val;
 	p += strlen(key);
 	return atoi(p);
+}
+
+static bool get_query_param_str(const char *req, const char *param, char *out_buf, size_t out_size)
+{
+	char needle[32];
+	snprintf(needle, sizeof(needle), "%s=", param);
+	const char *p = strstr(req, needle);
+	if (!p) {
+		return false;
+	}
+	p += strlen(needle);
+	size_t idx = 0;
+	while (*p && *p != '&' && *p != ' ' && *p != '\r' && *p != '\n' && idx + 1 < out_size) {
+		out_buf[idx++] = *p++;
+	}
+	out_buf[idx] = '\0';
+	return (idx > 0);
 }
 
 /* ========================================================================= */
@@ -1653,16 +1718,169 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					} else {
 						close(client_fd);
 					}
-				} else if (strncmp(rx_buf, "GET /api/download/csv", 21) == 0) {
+				} else if (strncmp(rx_buf, "GET /api/download/csv", 21) == 0 ||
+				           strncmp(rx_buf, "GET /download", 13) == 0 ||
+				           strncmp(rx_buf, "GET /telemetry.csv", 18) == 0) {
 					if (g_download_in_progress) {
 						const char *busy = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 17\r\n\r\nDownload in use\r\n";
 						send_all(client_fd, busy, strlen(busy));
 						close(client_fd);
 					} else {
+						char req_file[64] = "";
+						if (get_query_param_str(rx_buf, "file", req_file, sizeof(req_file))) {
+							const char *c = strrchr(req_file, '/');
+							if (c) {
+								c++;
+							} else {
+								c = req_file;
+							}
+							k_mutex_lock(&csv_path_mutex, K_FOREVER);
+							strncpy(g_download_target_file, c, sizeof(g_download_target_file) - 1);
+							g_download_target_file[sizeof(g_download_target_file) - 1] = '\0';
+							k_mutex_unlock(&csv_path_mutex);
+						} else {
+							k_mutex_lock(&csv_path_mutex, K_FOREVER);
+							g_download_target_file[0] = '\0';
+							k_mutex_unlock(&csv_path_mutex);
+						}
 						g_download_client_fd = client_fd;
 						g_download_in_progress = true;
 						k_sem_give(&download_start_sem);
 					}
+				} else if (strncmp(rx_buf, "GET /api/csv/list", 17) == 0) {
+					static char list_resp[2048];
+					int offset = snprintf(list_resp, sizeof(list_resp), "[");
+
+					if (sdcard_mounted) {
+						k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+						struct fs_dir_t dirp;
+						fs_dir_t_init(&dirp);
+						int rc = fs_opendir(&dirp, "/SD:");
+						if (rc == 0) {
+							bool first = true;
+							struct fs_dirent entry;
+							while (fs_readdir(&dirp, &entry) == 0) {
+								if (entry.name[0] == '\0') {
+									break;
+								}
+								if (entry.type == FS_DIR_ENTRY_FILE) {
+									size_t nlen = strlen(entry.name);
+									if (nlen > 4 && strcmp(entry.name + nlen - 4, ".csv") == 0) {
+										char today_base[64] = "";
+										k_mutex_lock(&csv_path_mutex, K_FOREVER);
+										const char *slash = strrchr(active_csv_filename, '/');
+										if (slash) {
+											strncpy(today_base, slash + 1, sizeof(today_base) - 1);
+										} else {
+											strncpy(today_base, active_csv_filename, sizeof(today_base) - 1);
+										}
+										k_mutex_unlock(&csv_path_mutex);
+
+										bool is_today = (strlen(today_base) > 0 && strcmp(entry.name, today_base) == 0);
+
+										int written = snprintf(list_resp + offset, sizeof(list_resp) - offset,
+										                      "%s{\"name\":\"%s\",\"size\":%zu,\"is_today\":%s}",
+										                      first ? "" : ",",
+										                      entry.name,
+										                      entry.size,
+										                      is_today ? "true" : "false");
+										if (written > 0 && offset + written < sizeof(list_resp) - 4) {
+											offset += written;
+											first = false;
+										}
+									}
+								}
+							}
+							fs_closedir(&dirp);
+						}
+						k_mutex_unlock(&sdcard_fs_mutex);
+					}
+
+					if (offset < sizeof(list_resp) - 3) {
+						list_resp[offset++] = ']';
+						list_resp[offset++] = '\r';
+						list_resp[offset++] = '\n';
+						list_resp[offset] = '\0';
+					}
+
+					char header[160];
+					int hlen = snprintf(header, sizeof(header),
+					                    "HTTP/1.1 200 OK\r\n"
+					                    "Content-Type: application/json\r\n"
+					                    "Access-Control-Allow-Origin: *\r\n"
+					                    "Content-Length: %d\r\n"
+					                    "Connection: close\r\n\r\n", offset);
+					send_all(client_fd, header, hlen);
+					send_all(client_fd, list_resp, offset);
+					close(client_fd);
+				} else if (strncmp(rx_buf, "POST /api/csv/delete", 20) == 0 ||
+				           strncmp(rx_buf, "GET /api/csv/delete", 19) == 0) {
+					char target_file[64] = "";
+					get_query_param_str(rx_buf, "file", target_file, sizeof(target_file));
+					const char *clean_name = strrchr(target_file, '/');
+					if (clean_name) {
+						clean_name++;
+					} else {
+						clean_name = target_file;
+					}
+
+					bool success = false;
+					bool recreated = false;
+
+					if (strlen(clean_name) > 4 && strcmp(clean_name + strlen(clean_name) - 4, ".csv") == 0 && sdcard_mounted) {
+						char fullpath[80];
+						snprintf(fullpath, sizeof(fullpath), "/SD:/%s", clean_name);
+
+						char today_path[64] = "";
+						k_mutex_lock(&csv_path_mutex, K_FOREVER);
+						strncpy(today_path, active_csv_filename, sizeof(today_path) - 1);
+						k_mutex_unlock(&csv_path_mutex);
+
+						bool is_today = (strlen(today_path) > 0 && strcmp(fullpath, today_path) == 0);
+
+						k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+						if (is_today) {
+							if (g_csv_file_is_open) {
+								fs_close(&g_csv_file);
+								g_csv_file_is_open = false;
+							}
+							fs_unlink(fullpath);
+							int res = fs_open(&g_csv_file, fullpath, FS_O_CREATE | FS_O_WRITE);
+							if (res == 0) {
+								const char *hdr = "timestamp_iso,uptime_ms,sample_id,rpm,temp_c,bus_volt_v,curr_ma\n";
+								fs_write(&g_csv_file, hdr, strlen(hdr));
+								fs_sync(&g_csv_file);
+								g_csv_file_is_open = true;
+								success = true;
+								recreated = true;
+								printk("[HTTP] Recreated active today CSV: %s\n", fullpath);
+							}
+						} else {
+							int ures = fs_unlink(fullpath);
+							if (ures == 0) {
+								success = true;
+								printk("[HTTP] Deleted old CSV: %s\n", fullpath);
+							}
+						}
+						k_mutex_unlock(&sdcard_fs_mutex);
+					}
+
+					char body[128];
+					int blen = snprintf(body, sizeof(body),
+					                    "{\"status\":\"%s\",\"recreated\":%s}\r\n",
+					                    success ? "ok" : "error",
+					                    recreated ? "true" : "false");
+					char header[160];
+					int hlen = snprintf(header, sizeof(header),
+					                    "HTTP/1.1 %s\r\n"
+					                    "Content-Type: application/json\r\n"
+					                    "Access-Control-Allow-Origin: *\r\n"
+					                    "Content-Length: %d\r\n"
+					                    "Connection: close\r\n\r\n",
+					                    success ? "200 OK" : "400 Bad Request", blen);
+					send_all(client_fd, header, hlen);
+					send_all(client_fd, body, blen);
+					close(client_fd);
 				} else if (strncmp(rx_buf, "POST /api/profile/config", 24) == 0 ||
 				           strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
@@ -1799,9 +2017,15 @@ static void csv_download_thread_fn(void *p1, void *p2, void *p3)
 		int client_fd = g_download_client_fd;
 		if (client_fd < 0) continue;
 
-		char target_file[64];
+		char target_file[80];
 		k_mutex_lock(&csv_path_mutex, K_FOREVER);
-		strncpy(target_file, active_csv_filename, sizeof(target_file) - 1);
+		if (strlen(g_download_target_file) > 0) {
+			snprintf(target_file, sizeof(target_file), "/SD:/%s", g_download_target_file);
+			g_download_target_file[0] = '\0';
+		} else {
+			strncpy(target_file, active_csv_filename, sizeof(target_file) - 1);
+			target_file[sizeof(target_file) - 1] = '\0';
+		}
 		k_mutex_unlock(&csv_path_mutex);
 
 		if (strlen(target_file) == 0) {

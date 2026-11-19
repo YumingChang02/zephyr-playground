@@ -386,14 +386,23 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 		uint32_t raw_rpm = (uint32_t)(((uint64_t)delta_pulses * 60000ULL) /
 		                              (CONFIG_APP_MOTOR_PULSES_PER_REV * (uint64_t)elapsed_ms));
 
-		/* Exponential Moving Average (EMA) to smooth out pulse quantization jitter */
+		/* Exponential Moving Average (EMA) scaled dynamically to CONFIG_APP_SAMPLE_RATE_HZ */
 		static uint32_t s_filtered_rpm = 0;
 		if (delta_pulses == 0) {
-			s_filtered_rpm = (s_filtered_rpm * 6) / 10;
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			s_filtered_rpm = (s_filtered_rpm * (CONFIG_APP_SAMPLE_RATE_HZ - 1)) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			s_filtered_rpm = 0;
+#endif
+			if (s_filtered_rpm < 30) s_filtered_rpm = 0;
 		} else if (s_filtered_rpm == 0) {
 			s_filtered_rpm = raw_rpm;
 		} else {
-			s_filtered_rpm = (s_filtered_rpm * 65 + raw_rpm * 35) / 100;
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			s_filtered_rpm = (s_filtered_rpm * (CONFIG_APP_SAMPLE_RATE_HZ - 1) + raw_rpm) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			s_filtered_rpm = raw_rpm;
+#endif
 		}
 		uint32_t rpm = s_filtered_rpm;
 
