@@ -25,6 +25,7 @@
 #include <zephyr/drivers/display.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/printk.h>
+#include <soc/ledc_struct.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -354,7 +355,14 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 			g_active_pwm_pct = target_duty;
 			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
 				uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
-				pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
+				int ret = pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
+				uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
+				uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+				uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+				printk("[APP_CPU] PWM HW Apply: target=%u%% (pulse=%u ns) -> ret=%d [LEDC reg: duty=%u, sig_en=%u, idle_lv=%u]\n",
+				       target_duty, pulse_ns, ret, hw_duty, sig_en, idle_lv);
+			} else {
+				printk("[APP_CPU] PWM ERROR: pwm_motor device NOT ready!\n");
 			}
 			g_disp_pwm_pct = target_duty;
 		}
