@@ -36,6 +36,7 @@
 #include <string.h>
 #include <time.h>
 
+#include <zephyr/sys/reboot.h>
 #include <zephyr/fs/fs.h>
 #include <ff.h>
 
@@ -394,6 +395,8 @@ static const char HTTP_HTML_PAGE[] =
 "<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F5D1;&#xFE0F; Cleanup:</span>"
 "<select id=\"clean-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Select log...</option></select>"
 "<button type=\"button\" onclick=\"deleteSelectedCsv()\" style=\"padding:3px 10px;background:#d32f2f;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x2716; Delete</button>"
+"<span style=\"border-left:1px solid #444;height:18px;margin:0 4px\"></span>"
+"<button type=\"button\" onclick=\"confirmReboot()\" style=\"padding:3px 10px;background:#e65100;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x1F504; Reboot</button>"
 "</div>"
 "<div class=\"cards\">"
 "<div class=\"card\"><div class=\"label\">Motor Speed</div><div class=\"val\"><span id=\"v-rpm\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">RPM</small></div></div>"
@@ -662,6 +665,16 @@ static const char HTTP_HTML_PAGE[] =
 "if(!confirm('Delete '+fn+'?\\n(If today\\'s log, it will be cleared & recreated)'))return;"
 "fetch('/api/csv/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'file='+encodeURIComponent(fn)})"
 ".then(r=>r.json()).then(j=>{alert('File '+(j.recreated?'cleared & recreated':'deleted'));loadCsvList();}).catch(e=>{alert('Error deleting');});"
+"}"
+"function confirmReboot(){"
+"if(!confirm('Reboot ESP32 controller?'))return;"
+"fetch('/api/reboot',{method:'POST'}).then(r=>r.json()).then(j=>{"
+"alert('Device is rebooting... This page will reconnect in 5 seconds.');"
+"setTimeout(()=>window.location.reload(),5000);"
+"}).catch(e=>{"
+"alert('Reboot requested. Reconnecting in 5 seconds...');"
+"setTimeout(()=>window.location.reload(),5000);"
+"});"
 "}"
 "loadCsvList();"
 "</script></body></html>";
@@ -1795,6 +1808,25 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						send_all(client_fd, header, hlen);
 						send_all(client_fd, body, blen);
 						close(client_fd);
+					}
+					/* Match POST /api/reboot or POST /api/reset or GET /api/reboot */
+					else if (strncmp(rx_buf, "POST /api/reboot", 16) == 0 ||
+					         strncmp(rx_buf, "POST /api/reset", 15) == 0 ||
+					         strncmp(rx_buf, "GET /api/reboot", 15) == 0) {
+						const char *resp =
+							"HTTP/1.1 200 OK\r\n"
+							"Content-Type: application/json\r\n"
+							"Access-Control-Allow-Origin: *\r\n"
+							"Content-Length: 23\r\n"
+							"Connection: close\r\n\r\n"
+							"{\"status\":\"rebooting\"}\r\n";
+						send_all(client_fd, resp, strlen(resp));
+						close(client_fd);
+
+						sdcard_flush_sync();
+						printk("[System] Reboot requested! Restarting SoC in 500ms...\n");
+						k_msleep(500);
+						sys_reboot(SYS_REBOOT_COLD);
 					}
 					/* 404 for unknown endpoints */
 					else {

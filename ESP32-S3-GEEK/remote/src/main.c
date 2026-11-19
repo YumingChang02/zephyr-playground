@@ -467,6 +467,21 @@ static void sensor_aggregator_thread_fn(void *arg1, void *arg2, void *arg3)
 			current_ma = 100 + (int32_t)((speed_sample.rpm * 120) / CONFIG_APP_MAX_FG_RPM) + (int32_t)prng_range(0, 10);
 		}
 
+		/* Dynamic EMA smoothing for current (mA) scaled to CONFIG_APP_SAMPLE_RATE_HZ */
+		static int32_t s_filtered_current_ma = 0;
+		static bool s_current_ma_init = false;
+		if (!s_current_ma_init) {
+			s_filtered_current_ma = current_ma;
+			s_current_ma_init = true;
+		} else {
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			s_filtered_current_ma = (s_filtered_current_ma * (CONFIG_APP_SAMPLE_RATE_HZ - 1) + current_ma) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			s_filtered_current_ma = current_ma;
+#endif
+		}
+		current_ma = s_filtered_current_ma;
+
 		g_disp_current_ma = current_ma;
 
 		telemetry_packet_t pkt = {

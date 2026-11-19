@@ -33,6 +33,7 @@
 #include <ctype.h>
 #include <time.h>
 
+#include <zephyr/sys/reboot.h>
 #include "telemetry.h"
 
 /* POSIX socket aliases */
@@ -494,6 +495,21 @@ static void sensor_aggregator_thread_fn(void *p1, void *p2, void *p3)
 			bus_mv = 12050 - (speed.rpm / 200);
 			temp_mc = 38500 + (speed.rpm * 2);
 		}
+
+		/* Dynamic EMA smoothing for current (mA) scaled to CONFIG_APP_SAMPLE_RATE_HZ */
+		static int32_t s_filtered_current_ma = 0;
+		static bool s_current_ma_init = false;
+		if (!s_current_ma_init) {
+			s_filtered_current_ma = current_ma;
+			s_current_ma_init = true;
+		} else {
+#if CONFIG_APP_SAMPLE_RATE_HZ > 1
+			s_filtered_current_ma = (s_filtered_current_ma * (CONFIG_APP_SAMPLE_RATE_HZ - 1) + current_ma) / CONFIG_APP_SAMPLE_RATE_HZ;
+#else
+			s_filtered_current_ma = current_ma;
+#endif
+		}
+		current_ma = s_filtered_current_ma;
 
 		g_disp_current_ma = current_ma;
 
@@ -1113,6 +1129,8 @@ static const char INDEX_HTML[] =
 "<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F5D1;&#xFE0F; Cleanup:</span>"
 "<select id=\"clean-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Select log...</option></select>"
 "<button type=\"button\" onclick=\"deleteSelectedCsv()\" style=\"padding:3px 10px;background:#d32f2f;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x2716; Delete</button>"
+"<span style=\"border-left:1px solid #444;height:18px;margin:0 4px\"></span>"
+"<button type=\"button\" onclick=\"confirmReboot()\" style=\"padding:3px 10px;background:#e65100;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x1F504; Reboot</button>"
 "</div>"
 "<div class=\"grid\">"
 "<div class=\"card\"><div class=\"card-title\">Motor Speed</div><div class=\"card-val\"><span id=\"v-rpm\">0</span> <span class=\"unit\">RPM</span></div></div>"
@@ -1271,6 +1289,16 @@ static const char INDEX_HTML[] =
 "if(!confirm('Delete '+fn+'?\\n(If today\\'s log, it will be cleared & recreated)'))return;"
 "fetch('/api/csv/delete',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'file='+encodeURIComponent(fn)})"
 ".then(r=>r.json()).then(j=>{alert('File '+(j.recreated?'cleared & recreated':'deleted'));loadCsvList();}).catch(e=>{alert('Error deleting');});"
+"}"
+"function confirmReboot(){"
+"if(!confirm('Reboot ESP32 controller?'))return;"
+"fetch('/api/reboot',{method:'POST'}).then(r=>r.json()).then(j=>{"
+"alert('Device is rebooting... This page will reconnect in 5 seconds.');"
+"setTimeout(()=>window.location.reload(),5000);"
+"}).catch(e=>{"
+"alert('Reboot requested. Reconnecting in 5 seconds...');"
+"setTimeout(()=>window.location.reload(),5000);"
+"});"
 "}"
 "loadCsvList();"
 "</script></body></html>";
@@ -1959,6 +1987,28 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"stopped\"}\r\n";
 					send_all(client_fd, res, strlen(res));
 					close(client_fd);
+				} else if (strncmp(rx_buf, "POST /api/reboot", 16) == 0 ||
+				           strncmp(rx_buf, "POST /api/reset", 15) == 0 ||
+				           strncmp(rx_buf, "GET /api/reboot", 15) == 0) {
+					const char *res =
+						"HTTP/1.1 200 OK\r\n"
+						"Content-Type: application/json\r\n"
+						"Access-Control-Allow-Origin: *\r\n"
+						"Content-Length: 23\r\n"
+						"Connection: close\r\n\r\n"
+						"{\"status\":\"rebooting\"}\r\n";
+					send_all(client_fd, res, strlen(res));
+					close(client_fd);
+
+					k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+					if (g_csv_file_is_open) {
+						fs_sync(&g_csv_file);
+					}
+					k_mutex_unlock(&sdcard_fs_mutex);
+
+					printk("[System] Reboot requested! Restarting SoC in 500ms...\n");
+					k_msleep(500);
+					sys_reboot(SYS_REBOOT_COLD);
 				} else {
 					/* Serve main dashboard HTML */
 					char hdr[128];
