@@ -168,9 +168,6 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 			g_prof_stage = PROFILE_STAGE_IDLE;
 			g_prof_elapsed_sec = 0;
 			g_active_pwm_pct = 0;
-			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
-				pwm_set_dt(&pwm_motor, pwm_motor.period, 0);
-			}
 			g_disp_pwm_pct = 0;
 			g_prof_log_pending = true;
 		} else if (ctrl->action == PWM_ACTION_MANUAL_PWM) {
@@ -179,10 +176,6 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 			uint32_t val = ctrl->manual_pwm;
 			if (val > 100) val = 100;
 			g_active_pwm_pct = val;
-			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
-				uint32_t pulse_ns = (pwm_motor.period * val) / 100;
-				pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
-			}
 			g_disp_pwm_pct = val;
 			g_prof_log_pending = true;
 		}
@@ -275,6 +268,7 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 		}
 
 		/* Evaluate autonomous looping 4-stage profile curve aligned to 00:00:00 */
+		uint32_t target_duty = 0;
 		if (g_prof_stage != PROFILE_STAGE_IDLE) {
 			uint32_t t1 = g_prof_cfg.t_low_sec;
 			uint32_t t2 = g_prof_cfg.t_up_sec;
@@ -285,7 +279,7 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 			uint32_t total = t1 + t2 + t3 + t4;
 			g_prof_total_sec = (uint16_t)total;
 
-			uint32_t target_duty = pL;
+			target_duty = pL;
 
 			if (total == 0) {
 				g_prof_elapsed_sec = 0;
@@ -346,18 +340,23 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 					}
 				}
 			}
+		} else {
+			target_duty = g_active_pwm_pct;
+		}
 
-			if (target_duty > 100) {
-				target_duty = 100;
+		if (target_duty > 100) {
+			target_duty = 100;
+		}
+
+		static uint32_t s_applied_pwm_pct = 0xFFFFFFFF;
+		if (target_duty != s_applied_pwm_pct) {
+			s_applied_pwm_pct = target_duty;
+			g_active_pwm_pct = target_duty;
+			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
+				uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
+				pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
 			}
-			if (target_duty != g_active_pwm_pct) {
-				g_active_pwm_pct = target_duty;
-				if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
-					uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
-					pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
-				}
-				g_disp_pwm_pct = target_duty;
-			}
+			g_disp_pwm_pct = target_duty;
 		}
 		duty_cycle_pct = g_active_pwm_pct;
 
