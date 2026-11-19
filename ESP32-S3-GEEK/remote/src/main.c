@@ -63,7 +63,9 @@ static void app_printk(const char *fmt, ...)
 #undef printk
 #define printk(fmt, ...) app_printk(fmt, ##__VA_ARGS__)
 
-#define CONFIG_APP_SAMPLE_RATE_HZ       3     /* Configured to 3 Hz */
+#ifndef CONFIG_APP_SAMPLE_RATE_HZ
+#define CONFIG_APP_SAMPLE_RATE_HZ       10    /* Fallback default 10 Hz */
+#endif
 #ifndef CONFIG_APP_MOTOR_PULSES_PER_REV
 #define CONFIG_APP_MOTOR_PULSES_PER_REV 6     /* 6 pulses per revolution */
 #endif

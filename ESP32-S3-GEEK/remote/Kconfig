@@ -1,0 +1,34 @@
+# Copyright 2026
+# SPDX-License-Identifier: Apache-2.0
+
+menu "Real-Time Sensor and Motor Sampling Configuration"
+
+config APP_SAMPLE_RATE_HZ
+	int "Sensor Sampling Rate (Hz)"
+	default 10
+	range 1 10
+	help
+	  Target sampling and update frequency for motor FG acquisition,
+	  INA219 power sampling, and inter-core telemetry (1 to 10 Hz).
+
+config APP_MOTOR_PULSES_PER_REV
+	int "Motor FG Pulses Per Revolution"
+	default 6
+	help
+	  Number of FG pulses generated per complete motor shaft revolution.
+
+config APP_MAX_FG_RPM
+	int "Maximum Motor FG RPM"
+	default 5500
+	help
+	  100% scale for Motor FG RPM gauge.
+
+config APP_MAX_POWER_W
+	int "Maximum Motor Power (Watts)"
+	default 25
+	help
+	  100% scale for Power gauge in Watts.
+
+endmenu
+
+source "Kconfig.zephyr"

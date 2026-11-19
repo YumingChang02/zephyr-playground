@@ -51,7 +51,7 @@
 /* Application Configuration & Priorities                                    */
 /* ========================================================================= */
 #ifndef CONFIG_APP_SAMPLE_RATE_HZ
-#define CONFIG_APP_SAMPLE_RATE_HZ       3
+#define CONFIG_APP_SAMPLE_RATE_HZ       10
 #endif
 #ifndef CONFIG_APP_MOTOR_PULSES_PER_REV
 #define CONFIG_APP_MOTOR_PULSES_PER_REV 6
@@ -1142,6 +1142,23 @@ static const char INDEX_HTML[] =
 "xP.stroke();"
 "if(sec>=0&&sec<=tot){const curX=(sec/tot)*w;xP.strokeStyle='#fff';xP.lineWidth=2;xP.beginPath();xP.moveTo(curX,0);xP.lineTo(curX,h);xP.stroke();}"
 "}"
+"let saveTimer=null;"
+"function saveConfig(){"
+"if(saveTimer)clearTimeout(saveTimer);"
+"saveTimer=setTimeout(()=>{"
+"const t1=parseInt(document.getElementById('t-low').value)||0;"
+"const t2=parseInt(document.getElementById('t-up').value)||0;"
+"const t3=parseInt(document.getElementById('t-high').value)||0;"
+"const t4=parseInt(document.getElementById('t-drop').value)||0;"
+"const pL=parseInt(document.getElementById('p-low').value)||0;"
+"const pH=parseInt(document.getElementById('p-high').value)||0;"
+"fetch('/api/profile/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4}).catch(e=>{});"
+"},300);"
+"}"
+"['t-low','t-up','t-high','t-drop','p-low','p-high'].forEach(id=>{"
+"const el=document.getElementById(id);"
+"if(el)el.addEventListener('input',()=>{drawCurve(-1);saveConfig();});"
+"});"
 "function startProfile(){"
 "const t1=parseInt(document.getElementById('t-low').value)||0;"
 "const t2=parseInt(document.getElementById('t-up').value)||0;"
@@ -1149,9 +1166,9 @@ static const char INDEX_HTML[] =
 "const t4=parseInt(document.getElementById('t-drop').value)||0;"
 "const pL=parseInt(document.getElementById('p-low').value)||0;"
 "const pH=parseInt(document.getElementById('p-high').value)||0;"
-"fetch('/api/profile/start?t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4).catch(e=>{});"
+"fetch('/api/profile/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4}).catch(e=>{});"
 "}"
-"function stopProfile(){fetch('/api/profile/stop').catch(e=>{});}"
+"function stopProfile(){fetch('/api/profile/stop',{method:'POST'}).catch(e=>{});}"
 "resize();"
 "fetch('/api/profile/config').then(r=>r.json()).then(cfg=>{"
 "document.getElementById('t-low').value=cfg.t_low;"
@@ -1646,8 +1663,18 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						g_download_in_progress = true;
 						k_sem_give(&download_start_sem);
 					}
-				} else if (strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
+				} else if (strncmp(rx_buf, "POST /api/profile/config", 24) == 0 ||
+				           strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
+					if (strstr(rx_buf, "t_low=")) {
+						g_prof_cfg.t_low_sec  = get_query_param_int(rx_buf, "t_low", g_prof_cfg.t_low_sec);
+						g_prof_cfg.p_low_pct  = get_query_param_int(rx_buf, "p_low", g_prof_cfg.p_low_pct);
+						g_prof_cfg.t_up_sec   = get_query_param_int(rx_buf, "t_up", g_prof_cfg.t_up_sec);
+						g_prof_cfg.t_high_sec = get_query_param_int(rx_buf, "t_high", g_prof_cfg.t_high_sec);
+						g_prof_cfg.p_high_pct = get_query_param_int(rx_buf, "p_high", g_prof_cfg.p_high_pct);
+						g_prof_cfg.t_drop_sec = get_query_param_int(rx_buf, "t_drop", g_prof_cfg.t_drop_sec);
+						g_prof_cfg.action = PWM_ACTION_SET_CONFIG_ONLY;
+					}
 					pwm_profile_ctrl_t cfg = g_prof_cfg;
 					k_spin_unlock(&profile_spinlock, pkey);
 
@@ -1661,7 +1688,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					send_all(client_fd, hdr, hlen);
 					send_all(client_fd, body, blen);
 					close(client_fd);
-				} else if (strncmp(rx_buf, "GET /api/profile/start", 22) == 0) {
+				} else if (strncmp(rx_buf, "POST /api/profile/start", 23) == 0 ||
+				           strncmp(rx_buf, "GET /api/profile/start", 22) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
 					if (strstr(rx_buf, "t_low=")) {
 						g_prof_cfg.t_low_sec  = get_query_param_int(rx_buf, "t_low", g_prof_cfg.t_low_sec);
@@ -1677,7 +1705,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"started\"}\r\n";
 					send_all(client_fd, res, strlen(res));
 					close(client_fd);
-				} else if (strncmp(rx_buf, "GET /api/profile/stop", 21) == 0) {
+				} else if (strncmp(rx_buf, "POST /api/profile/stop", 22) == 0 ||
+				           strncmp(rx_buf, "GET /api/profile/stop", 21) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
 					g_prof_cfg.action = PWM_ACTION_STOP_PROFILE;
 					k_spin_unlock(&profile_spinlock, pkey);

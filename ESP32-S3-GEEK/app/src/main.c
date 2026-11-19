@@ -22,8 +22,7 @@
  *   2. FAT32 SD Card Support with auto-format on startup if unformatted.
  *   3. Daily auto-rotating CSV file logging: /SD:/telemetry_YYYY-MM-DD.csv
  *   4. NTP client synchronization for absolute wall-clock timestamps in CSV & Web UI.
- *   5. Multi-client SSE server (/events) streaming up to 1-hour historical data from CSV on connect,
- *      followed by real-time sensor updates.
+ *   5. Multi-client SSE server (/events) real-time broadcast stream with zero blocking.
  *   6. Zero-dependency Canvas Dashboard with interactive hover tooltip & crosshair inspect.
  */
 
@@ -73,10 +72,8 @@
 #endif
 
 #ifndef CONFIG_APP_SAMPLE_RATE_HZ
-#define CONFIG_APP_SAMPLE_RATE_HZ   3     /* 3 Hz sampling & streaming */
+#define CONFIG_APP_SAMPLE_RATE_HZ   10    /* 10 Hz sampling & streaming */
 #endif
-
-#define MAX_HIST_REPLAY_SAMPLES     15    /* Fast preload of last 15 samples (~5s) for instant startup */
 
 #define PRIORITY_IPC_CONSOLE        6     /* Thread 0: Core 1 IPC Print Console */
 #define PRIORITY_LOW                7     /* Thread 1: SD Card CSV Logger */
@@ -487,7 +484,7 @@ static const char HTTP_HTML_PAGE[] =
 "const t4=parseInt(document.getElementById('t-drop').value)||0;"
 "const pL=parseInt(document.getElementById('p-low').value)||0;"
 "const pH=parseInt(document.getElementById('p-high').value)||0;"
-"fetch('/api/profile/config?t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4).catch(e=>{});"
+"fetch('/api/profile/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4}).catch(e=>{});"
 "},300);"
 "}"
 "function drawCurve(curSec){"
@@ -544,14 +541,14 @@ static const char HTTP_HTML_PAGE[] =
 "const total=t1+t2+t3+t4;"
 "if(total<=0){alert('Total profile duration must be > 0s');return;}"
 "document.getElementById('prof-status').innerText='Starting backend profile...';"
-"fetch('/api/profile/start?t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4)"
+"fetch('/api/profile/start',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'t_low='+t1+'&p_low='+pL+'&t_up='+t2+'&t_high='+t3+'&p_high='+pH+'&t_drop='+t4})"
 ".then(r=>r.json()).then(j=>{"
 "document.getElementById('prof-status').innerHTML='<b>Backend Profile (Loop) Running</b>';"
 "}).catch(e=>{document.getElementById('prof-status').innerText='Communication error';});"
 "}"
 "function stopProfile(){"
 "document.getElementById('prof-status').innerText='Stopping profile...';"
-"fetch('/api/profile/stop')"
+"fetch('/api/profile/stop',{method:'POST'})"
 ".then(r=>r.json()).then(j=>{"
 "document.getElementById('prof-status').innerText='Status: Stopped (0% PWM)';"
 "drawCurve(-1);"
@@ -576,7 +573,6 @@ static const char HTTP_HTML_PAGE[] =
 "evt.onmessage=e=>{"
 "try{"
 "const d=JSON.parse(e.data);"
-"if(d.type==='hist_done'){render();return;}"
 "pts.push(d);"
 "if(pts.length>MAX_PTS)pts.shift();"
 "document.getElementById('v-rpm').innerText=d.rpm;"
@@ -604,7 +600,7 @@ static const char HTTP_HTML_PAGE[] =
 "}"
 "if(d.clients!==undefined)document.getElementById('badge-sse').innerText='SSE: '+d.clients+' Client'+(d.clients===1?'':'s');"
 "if(d.ntp!==undefined){const nb=document.getElementById('badge-ntp');if(d.ntp){nb.className='badge ok';nb.innerText='NTP: Synced';}else{nb.className='badge';nb.innerText='NTP: Syncing...';}}"
-"if(!d.hist)render();"
+"render();"
 "}catch(err){}"
 "};"
 "evt.onerror=()=>{document.getElementById('badge-sse').className='badge err';document.getElementById('badge-sse').innerText='SSE: Reconnecting...';};"
@@ -790,96 +786,6 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			}
 		}
 	}
-}
-
-/* ========================================================================= */
-/* Replay Recent History from CSV to newly connected SSE Client (Max 1 hr)    */
-/* ========================================================================= */
-static void replay_csv_history_to_sse(int client_fd)
-{
-	char filepath[64] = "";
-	k_mutex_lock(&csv_path_mutex, K_FOREVER);
-	if (strlen(active_csv_filename) > 0) {
-		strncpy(filepath, active_csv_filename, sizeof(filepath));
-	}
-	k_mutex_unlock(&csv_path_mutex);
-
-	if (strlen(filepath) == 0 || !sdcard_mounted) {
-		return;
-	}
-
-	/* Flush any pending writes so file size and data on disk are current */
-	sdcard_flush_sync();
-
-	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
-	struct fs_dirent entry;
-	if (fs_stat(filepath, &entry) != 0 || entry.size == 0) {
-		k_mutex_unlock(&sdcard_fs_mutex);
-		return;
-	}
-
-	struct fs_file_t rf;
-	fs_file_t_init(&rf);
-	if (fs_open(&rf, filepath, FS_O_READ) != 0) {
-		k_mutex_unlock(&sdcard_fs_mutex);
-		return;
-	}
-
-	const off_t max_bytes = MAX_HIST_REPLAY_SAMPLES * 65;
-	if (entry.size > max_bytes) {
-		fs_seek(&rf, entry.size - max_bytes, FS_SEEK_SET);
-		char c;
-		while (fs_read(&rf, &c, 1) > 0 && c != '\n');
-	} else {
-		char c;
-		while (fs_read(&rf, &c, 1) > 0 && c != '\n');
-	}
-
-	char line_buf[128];
-	size_t idx = 0;
-	char ch;
-	int sent_count = 0;
-
-	while (fs_read(&rf, &ch, 1) > 0) {
-		if (ch == '\n' || ch == '\r') {
-			if (idx > 0) {
-				line_buf[idx] = '\0';
-				char t_iso[32];
-				long long up;
-				unsigned int sid, rpm;
-				int curr;
-				int tc_int, tc_fr;
-				unsigned int v_int, v_fr;
-
-				if (sscanf(line_buf, "%31[^,],%lld,%u,%u,%d.%d,%u.%u,%d",
-				           t_iso, &up, &sid, &rpm, &tc_int, &tc_fr, &v_int, &v_fr, &curr) >= 8) {
-					char sse_item[220];
-					int slen = snprintf(sse_item, sizeof(sse_item),
-					                    "data: {\"id\":%u,\"rpm\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"hist\":true}\n\n",
-					                    sid, rpm, tc_int, tc_fr, v_int, v_fr, curr, up, t_iso);
-					if (send_all(client_fd, sse_item, slen) < 0) {
-						break;
-					}
-					sent_count++;
-					if (sent_count >= MAX_HIST_REPLAY_SAMPLES) {
-						break;
-					}
-				}
-				idx = 0;
-			}
-		} else {
-			if (idx < sizeof(line_buf) - 1) {
-				line_buf[idx++] = ch;
-			}
-		}
-	}
-
-	fs_close(&rf);
-	k_mutex_unlock(&sdcard_fs_mutex);
-
-	const char *hist_done = "data: {\"type\":\"hist_done\"}\n\n";
-	send_all(client_fd, hist_done, strlen(hist_done));
-	printk("[HTTP] Replayed %d historical CSV records to SSE client\n", sent_count);
 }
 
 static K_SEM_DEFINE(download_start_sem, 0, 1);
@@ -1429,10 +1335,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 								"Access-Control-Allow-Origin: *\r\n\r\n";
 
 							if (send_all(client_fd, sse_headers, strlen(sse_headers)) == 0) {
-								replay_csv_history_to_sse(client_fd);
 								sse_clients[slot].fd = client_fd;
 								sse_clients[slot].last_sent_id = 0;
-								printk("[HTTP] SSE client #%d connected on fd %d\n",
+								printk("[HTTP] SSE client #%d connected on fd %d (broadcast only)\n",
 								       slot + 1, client_fd);
 							} else {
 								close(client_fd);
@@ -1478,8 +1383,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							k_sem_give(&download_start_sem);
 						}
 					}
-					/* Match GET /api/profile/config */
-					else if (strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
+					/* Match POST /api/profile/config or GET /api/profile/config */
+					else if (strncmp(rx_buf, "POST /api/profile/config", 24) == 0 ||
+					         strncmp(rx_buf, "GET /api/profile/config", 23) == 0) {
 						if (strstr(rx_buf, "t_low=")) {
 							int t_low  = get_query_param_int(rx_buf, "t_low", g_active_profile_cfg.t_low_sec);
 							int p_low  = get_query_param_int(rx_buf, "p_low", g_active_profile_cfg.p_low_pct);
@@ -1553,9 +1459,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						send_all(client_fd, body, blen);
 						close(client_fd);
 					}
-					/* Match GET /api/profile/start or action=start */
-					else if (strncmp(rx_buf, "GET /api/profile/start", 22) == 0 ||
-					         (strncmp(rx_buf, "GET /api/profile", 16) == 0 && strstr(rx_buf, "action=start"))) {
+					/* Match POST /api/profile/start or GET /api/profile/start */
+					else if (strncmp(rx_buf, "POST /api/profile/start", 23) == 0 ||
+					         strncmp(rx_buf, "GET /api/profile/start", 22) == 0 ||
+					         ((strncmp(rx_buf, "POST /api/profile", 17) == 0 || strncmp(rx_buf, "GET /api/profile", 16) == 0) &&
+					          strstr(rx_buf, "action=start"))) {
 						if (strstr(rx_buf, "t_low=")) {
 							int t_low  = get_query_param_int(rx_buf, "t_low", g_active_profile_cfg.t_low_sec);
 							int p_low  = get_query_param_int(rx_buf, "p_low", g_active_profile_cfg.p_low_pct);
@@ -1592,9 +1500,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						send_all(client_fd, resp, strlen(resp));
 						close(client_fd);
 					}
-					/* Match GET /api/profile/stop or action=stop */
-					else if (strncmp(rx_buf, "GET /api/profile/stop", 21) == 0 ||
-					         (strncmp(rx_buf, "GET /api/profile", 16) == 0 && strstr(rx_buf, "action=stop"))) {
+					/* Match POST /api/profile/stop or GET /api/profile/stop */
+					else if (strncmp(rx_buf, "POST /api/profile/stop", 22) == 0 ||
+					         strncmp(rx_buf, "GET /api/profile/stop", 21) == 0 ||
+					         ((strncmp(rx_buf, "POST /api/profile", 17) == 0 || strncmp(rx_buf, "GET /api/profile", 16) == 0) &&
+					          strstr(rx_buf, "action=stop"))) {
 						g_active_profile_cfg.action = PWM_ACTION_STOP_PROFILE;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
 							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
@@ -1609,8 +1519,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						send_all(client_fd, resp, strlen(resp));
 						close(client_fd);
 					}
-					/* Match GET /api/pwm?val=... */
-					else if (strncmp(rx_buf, "GET /api/pwm", 12) == 0) {
+					/* Match POST /api/pwm or GET /api/pwm */
+					else if (strncmp(rx_buf, "POST /api/pwm", 13) == 0 ||
+					         strncmp(rx_buf, "GET /api/pwm", 12) == 0) {
 						int target_val = get_query_param_int(rx_buf, "val", 50);
 						if (target_val < 0) target_val = 0;
 						if (target_val > 100) target_val = 100;

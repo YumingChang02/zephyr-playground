@@ -107,7 +107,10 @@ The firmware runs a **true Asymmetric Multiprocessing (AMP)** pipeline across bo
    - Streams the active day's CSV log directly from the SD card to the browser as an attachment (`Content-Disposition: attachment; filename="telemetry_YYYY-MM-DD.csv"`).
 3. **`GET /events` (Server-Sent Events Stream)**:
    - Supports **multiple simultaneous clients** (`MAX_SSE_CLIENTS = 4`) multiplexed using non-blocking I/O (`zsock_poll`).
-   - **Recent History Replay**: When a client connects, reads the last data (clipped to max 1 hour = 3600 samples) from the current day's CSV file on the SD card, sends it over SSE (tagged with `"hist":true`), and then seamlessly continues streaming live telemetry events!
+   - **Zero-Blocking Real-Time Broadcast**: Pure real-time telemetry streaming directly from Core 1 IPM frames without disk access latency or lock contention.
+4. **`POST /api/profile/config`, `/start`, `/stop`, `/pwm` (REST Control APIs)**:
+   - Stage profile configuration and execution via HTTP `POST` (with `GET` fallback).
+   - Non-blocking execution sends IPM command packets immediately to Core 1 (`APP_CPU`).
 
 ---
 

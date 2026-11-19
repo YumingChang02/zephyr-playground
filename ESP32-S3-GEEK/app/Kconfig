@@ -40,7 +40,7 @@ menu "Sensor and Sampling Configuration"
 
 config APP_SAMPLE_RATE_HZ
 	int "Sensor Sampling Rate (Hz)"
-	default 3
+	default 10
 	range 1 10
 	help
 	  Target sampling and update frequency for sensor acquisition,
