@@ -276,19 +276,36 @@ static void sync_time_to_app_cpu(int64_t now_ms, bool force)
 	ipm_send(ipm_dev, 0, IPM_CHANNEL_TIME_SYNC, &t_sync, sizeof(t_sync));
 }
 
-/* Helper to reliably send all bytes across a TCP socket */
+/* Helper to reliably send all bytes across a TCP socket with non-blocking retry */
 static int send_all(int sock, const void *buf, size_t len)
 {
 	const char *p = (const char *)buf;
 	while (len > 0) {
 		int sent = send(sock, p, len, 0);
 		if (sent <= 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				k_msleep(1);
+				continue;
+			}
 			return -1;
 		}
 		p += sent;
 		len -= sent;
 	}
 	return 0;
+}
+
+/* Non-blocking SSE pusher: skips frame on transient backpressure without dropping client */
+static int send_sse_frame(int sock, const void *buf, size_t len)
+{
+	int sent = send(sock, buf, len, ZSOCK_MSG_DONTWAIT);
+	if (sent < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+			return 0; /* Transient full queue, skip without disconnecting */
+		}
+		return -1; /* Fatal socket disconnect */
+	}
+	return 1;
 }
 
 /* ========================================================================= */
@@ -630,7 +647,14 @@ static const char HTTP_HTML_PAGE[] =
 "}"
 "function downloadSelectedCsv(){"
 "const s=document.getElementById('csv-select');if(!s||!s.value)return;"
-"window.location.href='/download?file='+encodeURIComponent(s.value);"
+"const fn=s.value;"
+"const a=document.createElement('a');"
+"a.href='/download?file='+encodeURIComponent(fn);"
+"a.download=fn;"
+"a.style.display='none';"
+"document.body.appendChild(a);"
+"a.click();"
+"setTimeout(()=>document.body.removeChild(a),1000);"
 "}"
 "function deleteSelectedCsv(){"
 "const s=document.getElementById('clean-select');if(!s||!s.value){alert('Select a log file to delete');return;}"
@@ -827,6 +851,7 @@ static K_SEM_DEFINE(download_start_sem, 0, 1);
 static volatile int g_download_client_fd = -1;
 static volatile bool g_download_in_progress = false;
 static char g_download_target_file[64] = "";
+static uint8_t s_download_buf[4096];
 
 static void handle_http_csv_download(int client_fd)
 {
@@ -873,6 +898,9 @@ static void handle_http_csv_download(int client_fd)
 		return;
 	}
 
+	int one = 1;
+	zsock_setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
 	const char *basename = strrchr(filepath, '/');
 	if (basename) {
 		basename++;
@@ -895,22 +923,27 @@ static void handle_http_csv_download(int client_fd)
 		return;
 	}
 
-	char chunk[512];
+	uint32_t chunk_count = 0;
 	while (1) {
 		k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
-		ssize_t bytes_read = fs_read(&rf, chunk, sizeof(chunk));
+		ssize_t bytes_read = fs_read(&rf, s_download_buf, sizeof(s_download_buf));
 		k_mutex_unlock(&sdcard_fs_mutex);
 
 		if (bytes_read <= 0) {
 			break;
 		}
 
-		if (send_all(client_fd, chunk, (size_t)bytes_read) < 0) {
+		if (send_all(client_fd, s_download_buf, (size_t)bytes_read) < 0) {
 			break;
 		}
 
-		/* Yield CPU so HTTP server, live SSE streaming, and SD logger remain responsive */
-		k_msleep(2);
+		chunk_count++;
+		if ((chunk_count % 4) == 0) {
+			/* Brief 1ms rest every 16 KB to let Wi-Fi buffers and other threads breathe */
+			k_msleep(1);
+		} else {
+			k_yield();
+		}
 	}
 
 	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
@@ -1394,6 +1427,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 								"Access-Control-Allow-Origin: *\r\n\r\n";
 
 							if (send_all(client_fd, sse_headers, strlen(sse_headers)) == 0) {
+								int one = 1;
+								zsock_setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 								sse_clients[slot].fd = client_fd;
 								sse_clients[slot].last_sent_id = 0;
 								printk("[HTTP] SSE client #%d connected on fd %d (broadcast only)\n",
@@ -1852,11 +1887,12 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 				for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 					if (sse_clients[i].fd >= 0 &&
 					    sse_clients[i].last_sent_id != cur.sample_id) {
-						if (send_all(sse_clients[i].fd, sse_data, sse_len) < 0) {
-							printk("[HTTP] SSE client #%d write failed, closing\n", i + 1);
+						int r = send_sse_frame(sse_clients[i].fd, sse_data, sse_len);
+						if (r < 0) {
+							printk("[HTTP] SSE client #%d disconnected (err %d), closing\n", i + 1, errno);
 							close(sse_clients[i].fd);
 							sse_clients[i].fd = -1;
-						} else {
+						} else if (r > 0) {
 							sse_clients[i].last_sent_id = cur.sample_id;
 						}
 					}

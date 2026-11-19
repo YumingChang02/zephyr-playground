@@ -226,19 +226,36 @@ static void get_formatted_time(char *iso_buf, size_t iso_len, char *date_buf, si
 	}
 }
 
-/* Helper to reliably send all bytes across a TCP socket */
+/* Helper to reliably send all bytes across a TCP socket with non-blocking retry */
 static int send_all(int sock, const void *buf, size_t len)
 {
 	const char *p = (const char *)buf;
 	while (len > 0) {
 		int sent = send(sock, p, len, 0);
 		if (sent <= 0) {
+			if (errno == EAGAIN || errno == EWOULDBLOCK) {
+				k_msleep(1);
+				continue;
+			}
 			return -1;
 		}
 		p += sent;
 		len -= sent;
 	}
 	return 0;
+}
+
+/* Non-blocking SSE pusher: skips frame on transient backpressure without dropping client */
+static int send_sse_frame(int sock, const void *buf, size_t len)
+{
+	int sent = send(sock, buf, len, ZSOCK_MSG_DONTWAIT);
+	if (sent < 0) {
+		if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS) {
+			return 0; /* Transient full queue, skip without disconnecting */
+		}
+		return -1; /* Fatal socket disconnect */
+	}
+	return 1;
 }
 
 /* ========================================================================= */
@@ -1121,7 +1138,7 @@ static const char INDEX_HTML[] =
 "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\">"
 "<button onclick=\"startProfile()\">&#x25B6; Run Profile (Loop)</button>"
 "<button class=\"stop\" onclick=\"stopProfile()\">&#x23F9; Stop (0%)</button>"
-"<a href=\"/api/download/csv\" style=\"text-decoration:none\"><button type=\"button\" class=\"dl\">&#x2193; Download CSV</button></a>"
+"<button type=\"button\" class=\"dl\" onclick=\"downloadSelectedCsv()\">&#x2193; Download CSV</button>"
 "<span id=\"prof-status\" style=\"font-size:0.8rem;color:#81c784\">Status: Initializing...</span>"
 "</div>"
 "</div>"
@@ -1237,8 +1254,16 @@ static const char INDEX_HTML[] =
 "}).catch(e=>{});"
 "}"
 "function downloadSelectedCsv(){"
-"const s=document.getElementById('csv-select');if(!s||!s.value)return;"
-"window.location.href='/download?file='+encodeURIComponent(s.value);"
+"const s=document.getElementById('csv-select');"
+"const fn=s&&s.value?s.value:'';"
+"const url=fn?('/download?file='+encodeURIComponent(fn)):'/api/download/csv';"
+"const a=document.createElement('a');"
+"a.href=url;"
+"if(fn)a.download=fn;"
+"a.style.display='none';"
+"document.body.appendChild(a);"
+"a.click();"
+"setTimeout(()=>document.body.removeChild(a),1000);"
 "}"
 "function deleteSelectedCsv(){"
 "const s=document.getElementById('clean-select');if(!s||!s.value){alert('Select a log file to delete');return;}"
@@ -1713,6 +1738,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						if (sse_clients[i].fd < 0) { slot = i; break; }
 					}
 					if (slot >= 0) {
+						int one = 1;
+						zsock_setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 						sse_clients[slot].fd = client_fd;
 						sse_clients[slot].last_sent_id = 0;
 					} else {
@@ -1989,10 +2016,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 				if (sse_clients[i].fd >= 0 && sse_clients[i].last_sent_id != cur.sample_id) {
-					if (send_all(sse_clients[i].fd, sse_data, sse_len) < 0) {
+					int r = send_sse_frame(sse_clients[i].fd, sse_data, sse_len);
+					if (r < 0) {
 						close(sse_clients[i].fd);
 						sse_clients[i].fd = -1;
-					} else {
+					} else if (r > 0) {
 						sse_clients[i].last_sent_id = cur.sample_id;
 					}
 				}
@@ -2004,6 +2032,8 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 /* ========================================================================= */
 /* Thread 6: Non-blocking Background CSV Download (Priority 9)               */
 /* ========================================================================= */
+static uint8_t s_download_buf[4096];
+
 static void csv_download_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -2050,6 +2080,9 @@ static void csv_download_thread_fn(void *p1, void *p2, void *p3)
 			continue;
 		}
 
+		int one = 1;
+		zsock_setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+
 		const char *fname = strrchr(target_file, '/');
 		fname = fname ? fname + 1 : target_file;
 
@@ -2061,15 +2094,22 @@ static void csv_download_thread_fn(void *p1, void *p2, void *p3)
 		                    "Connection: close\r\n\r\n", fname);
 		send_all(client_fd, header, hlen);
 
-		char read_buf[512];
+		uint32_t chunk_count = 0;
 		while (1) {
 			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
-			ssize_t bytes_read = fs_read(&rfile, read_buf, sizeof(read_buf));
+			ssize_t bytes_read = fs_read(&rfile, s_download_buf, sizeof(s_download_buf));
 			k_mutex_unlock(&sdcard_fs_mutex);
 
 			if (bytes_read <= 0) break;
-			if (send_all(client_fd, read_buf, (size_t)bytes_read) < 0) break;
-			k_msleep(2); /* Throttle to avoid starving other threads */
+			if (send_all(client_fd, s_download_buf, (size_t)bytes_read) < 0) break;
+
+			chunk_count++;
+			if ((chunk_count % 4) == 0) {
+				/* Brief 1ms rest every 16 KB to let Wi-Fi buffers and other threads breathe */
+				k_msleep(1);
+			} else {
+				k_yield();
+			}
 		}
 
 		k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
