@@ -1131,6 +1131,7 @@ static const char INDEX_HTML[] =
 "<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F4BE; CSV Log:</span>"
 "<select id=\"csv-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Loading logs...</option></select>"
 "<button type=\"button\" onclick=\"downloadSelectedCsv()\" style=\"padding:3px 10px;background:#0288d1;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x1F4E5; Download</button>"
+"<button type=\"button\" id=\"btn-refresh\" onclick=\"loadCsvList(true)\" style=\"padding:3px 10px;background:#455a64;color:#fff;border:none;border-radius:4px;font-size:0.75rem;font-weight:600;cursor:pointer\">&#x21BB; Refresh</button>"
 "<span style=\"border-left:1px solid #444;height:18px;margin:0 4px\"></span>"
 "<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F5D1;&#xFE0F; Cleanup:</span>"
 "<select id=\"clean-select\" style=\"background:#2a2a2a;color:#fff;border:1px solid #555;border-radius:4px;padding:3px 8px;font-size:0.75rem\"><option value=\"\">Select log...</option></select>"
@@ -1262,20 +1263,27 @@ static const char INDEX_HTML[] =
 "render();"
 "}catch(err){}"
 "};"
-"function loadCsvList(){"
+"function loadCsvList(manual){"
+"const btn=document.getElementById('btn-refresh');"
+"if(manual&&btn){btn.innerText='Refreshing...';btn.disabled=true;}"
 "fetch('/api/csv/list').then(r=>r.json()).then(files=>{"
 "const dl=document.getElementById('csv-select'),cl=document.getElementById('clean-select');"
 "if(!dl||!cl)return;"
+"const curDl=dl.value,curCl=cl.value;"
 "dl.innerHTML='';cl.innerHTML='<option value=\"\">Select log...</option>';"
 "if(!files||files.length===0){dl.innerHTML='<option value=\"\">No logs found</option>';return;}"
 "files.forEach(f=>{"
+"const sz=f.size>1048576?(f.size/1048576).toFixed(1)+' MB':(f.size<1024?f.size+' B':Math.round(f.size/1024)+' KB');"
 "const o1=document.createElement('option');o1.value=f.name;"
-"o1.textContent=f.name+' ('+Math.round(f.size/1024)+' KB)'+(f.is_today?' [Today]':'');"
-"if(f.is_today)o1.selected=true;dl.appendChild(o1);"
+"o1.textContent=f.name+' ('+sz+')'+(f.is_today?' [Today]':'');"
+"if(curDl?f.name===curDl:f.is_today)o1.selected=true;dl.appendChild(o1);"
 "const o2=document.createElement('option');o2.value=f.name;"
-"o2.textContent=f.name+(f.is_today?' [Today: Recreate]':'');cl.appendChild(o2);"
+"o2.textContent=f.name+' ('+sz+')'+(f.is_today?' [Today: Recreate]':'');"
+"if(f.name===curCl)o2.selected=true;cl.appendChild(o2);"
 "});"
-"}).catch(e=>{});"
+"}).catch(e=>{}).finally(()=>{"
+"if(btn){btn.innerHTML='&#x21BB; Refresh';btn.disabled=false;}"
+"});"
 "}"
 "function downloadSelectedCsv(){"
 "const s=document.getElementById('csv-select');"
@@ -1810,6 +1818,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 					if (sdcard_mounted) {
 						k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+						if (g_csv_file_is_open) {
+							fs_sync(&g_csv_file);
+						}
 						struct fs_dir_t dirp;
 						fs_dir_t_init(&dirp);
 						int rc = fs_opendir(&dirp, "/SD:");
