@@ -361,7 +361,7 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		uint32_t total = t1 + t2 + t3 + t4;
 		g_prof_total_sec = (uint16_t)total;
 
-		if (cfg.action == PWM_ACTION_START_PROFILE && total > 0) {
+		if ((cfg.action == PWM_ACTION_START_PROFILE || cfg.action == PWM_ACTION_SET_CONFIG_ONLY) && total > 0) {
 			uint32_t phase_sec = cur_sec_of_day % total;
 			prof_elapsed = (uint16_t)phase_sec;
 
@@ -1031,11 +1031,12 @@ static void sd_logging_thread_fn(void *p1, void *p2, void *p3)
 
 		const char *day_str = packet.date_str;
 
-		/* Daily rotation */
-		if (strcmp(day_str, current_day_str) != 0) {
+		/* Daily rotation, or reopen if closed/recreated */
+		if (strcmp(day_str, current_day_str) != 0 || !g_csv_file_is_open) {
 			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 			if (g_csv_file_is_open) {
 				fs_close(&g_csv_file);
+				fs_file_t_init(&g_csv_file);
 				g_csv_file_is_open = false;
 			}
 			k_mutex_unlock(&sdcard_fs_mutex);
@@ -1061,7 +1062,12 @@ static void sd_logging_thread_fn(void *p1, void *p2, void *p3)
 				printk("[SD Card] Opened CSV log: %s\n", filepath);
 				k_mutex_lock(&csv_path_mutex, K_FOREVER);
 				strncpy(active_csv_filename, filepath, sizeof(active_csv_filename) - 1);
+				active_csv_filename[sizeof(active_csv_filename) - 1] = '\0';
 				k_mutex_unlock(&csv_path_mutex);
+			} else {
+				fs_file_t_init(&g_csv_file);
+				g_csv_file_is_open = false;
+				printk("[SD Card] Failed to open CSV log: %s (err %d)\n", filepath, res);
 			}
 			k_mutex_unlock(&sdcard_fs_mutex);
 		}
@@ -1292,13 +1298,9 @@ static const char INDEX_HTML[] =
 "}"
 "function confirmReboot(){"
 "if(!confirm('Reboot ESP32 controller?'))return;"
-"fetch('/api/reboot',{method:'POST'}).then(r=>r.json()).then(j=>{"
-"alert('Device is rebooting... This page will reconnect in 5 seconds.');"
-"setTimeout(()=>window.location.reload(),5000);"
-"}).catch(e=>{"
-"alert('Reboot requested. Reconnecting in 5 seconds...');"
-"setTimeout(()=>window.location.reload(),5000);"
-"});"
+"fetch('/api/reboot',{method:'POST'}).catch(e=>{});"
+"document.body.innerHTML='<div style=\"font-family:sans-serif;background:#121212;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0\"><h2 style=\"color:#ffb74d\">&#x1F504; Rebooting Controller...</h2><p style=\"color:#aaa\">Reconnecting to dashboard in <span id=\"cd\">5</span>s</p></div>';"
+"let cnt=5;const tm=setInterval(()=>{cnt--;const el=document.getElementById('cd');if(el)el.innerText=cnt;if(cnt<=0){clearInterval(tm);window.location.reload();}},1000);"
 "}"
 "loadCsvList();"
 "</script></body></html>";
@@ -1897,10 +1899,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						if (is_today) {
 							if (g_csv_file_is_open) {
 								fs_close(&g_csv_file);
+								fs_file_t_init(&g_csv_file);
 								g_csv_file_is_open = false;
 							}
 							fs_unlink(fullpath);
-							int res = fs_open(&g_csv_file, fullpath, FS_O_CREATE | FS_O_WRITE);
+							int res = fs_open(&g_csv_file, fullpath, FS_O_CREATE | FS_O_WRITE | FS_O_APPEND);
 							if (res == 0) {
 								const char *hdr = "timestamp_iso,uptime_ms,sample_id,rpm,temp_c,bus_volt_v,curr_ma\n";
 								fs_write(&g_csv_file, hdr, strlen(hdr));
@@ -1909,6 +1912,10 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 								success = true;
 								recreated = true;
 								printk("[HTTP] Recreated active today CSV: %s\n", fullpath);
+							} else {
+								fs_file_t_init(&g_csv_file);
+								g_csv_file_is_open = false;
+								printk("[HTTP] Failed to recreate active CSV: %s (err %d)\n", fullpath, res);
 							}
 						} else {
 							int ures = fs_unlink(fullpath);
@@ -1946,7 +1953,6 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						g_prof_cfg.t_high_sec = get_query_param_int(rx_buf, "t_high", g_prof_cfg.t_high_sec);
 						g_prof_cfg.p_high_pct = get_query_param_int(rx_buf, "p_high", g_prof_cfg.p_high_pct);
 						g_prof_cfg.t_drop_sec = get_query_param_int(rx_buf, "t_drop", g_prof_cfg.t_drop_sec);
-						g_prof_cfg.action = PWM_ACTION_SET_CONFIG_ONLY;
 					}
 					pwm_profile_ctrl_t cfg = g_prof_cfg;
 					k_spin_unlock(&profile_spinlock, pkey);
@@ -1998,6 +2004,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						"Connection: close\r\n\r\n"
 						"{\"status\":\"rebooting\"}\r\n";
 					send_all(client_fd, res, strlen(res));
+					k_msleep(50);
 					close(client_fd);
 
 					k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
@@ -2006,8 +2013,16 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					}
 					k_mutex_unlock(&sdcard_fs_mutex);
 
-					printk("[System] Reboot requested! Restarting SoC in 500ms...\n");
-					k_msleep(500);
+					/* Stop motor PWM before reboot */
+					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
+					g_prof_cfg.action = PWM_ACTION_STOP_PROFILE;
+					k_spin_unlock(&profile_spinlock, pkey);
+					if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
+						pwm_set_dt(&pwm_motor, pwm_motor.period, 0);
+					}
+
+					printk("[System] Reboot requested! Restarting SoC in 200ms...\n");
+					k_msleep(200);
 					sys_reboot(SYS_REBOOT_COLD);
 				} else {
 					/* Serve main dashboard HTML */

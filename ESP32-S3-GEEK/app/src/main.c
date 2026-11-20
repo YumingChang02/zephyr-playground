@@ -258,7 +258,7 @@ static void sync_time_to_app_cpu(int64_t now_ms, bool force)
 		t_sync.sec_of_day = uptime_sec % 86400U;
 	}
 
-	ipm_send(ipm_dev, 0, IPM_CHANNEL_TIME_SYNC, &t_sync, sizeof(t_sync));
+	ipm_send(ipm_dev, 1, IPM_CHANNEL_TIME_SYNC, &t_sync, sizeof(t_sync));
 }
 
 /* Helper to reliably send all bytes across a TCP socket with non-blocking retry */
@@ -652,13 +652,9 @@ static const char HTTP_HTML_PAGE[] =
 "}"
 "function confirmReboot(){"
 "if(!confirm('Reboot ESP32 controller?'))return;"
-"fetch('/api/reboot',{method:'POST'}).then(r=>r.json()).then(j=>{"
-"alert('Device is rebooting... This page will reconnect in 5 seconds.');"
-"setTimeout(()=>window.location.reload(),5000);"
-"}).catch(e=>{"
-"alert('Reboot requested. Reconnecting in 5 seconds...');"
-"setTimeout(()=>window.location.reload(),5000);"
-"});"
+"fetch('/api/reboot',{method:'POST'}).catch(e=>{});"
+"document.body.innerHTML='<div style=\"font-family:sans-serif;background:#121212;color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0\"><h2 style=\"color:#ffb74d\">&#x1F504; Rebooting Controller...</h2><p style=\"color:#aaa\">Reconnecting to dashboard in <span id=\"cd\">5</span>s</p></div>';"
+"let cnt=5;const tm=setInterval(()=>{cnt--;const el=document.getElementById('cd');if(el)el.innerText=cnt;if(cnt<=0){clearInterval(tm);window.location.reload();}},1000);"
 "}"
 "loadCsvList();"
 "</script></body></html>";
@@ -778,14 +774,14 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			continue;
 		}
 
-		/* Daily file rotation: If day changed or first run */
-		if (strcmp(day_str, current_day_str) != 0) {
+		/* Daily file rotation: If day changed, first run, or file closed/recreated */
+		if (strcmp(day_str, current_day_str) != 0 || !g_csv_file_is_open) {
 			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 			if (g_csv_file_is_open) {
 				fs_close(&g_csv_file);
+				fs_file_t_init(&g_csv_file);
 				g_csv_file_is_open = false;
 			}
-			k_mutex_unlock(&sdcard_fs_mutex);
 
 			prune_old_csv_files();
 
@@ -793,7 +789,6 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			char filepath[64];
 			snprintf(filepath, sizeof(filepath), "/SD:/telemetry_%s.csv", current_day_str);
 
-			k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 			struct fs_dirent entry;
 			bool exists = (fs_stat(filepath, &entry) == 0);
 
@@ -810,17 +805,21 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 				k_mutex_unlock(&sdcard_fs_mutex);
 
 				k_mutex_lock(&csv_path_mutex, K_FOREVER);
-				strncpy(active_csv_filename, filepath, sizeof(active_csv_filename));
+				strncpy(active_csv_filename, filepath, sizeof(active_csv_filename) - 1);
+				active_csv_filename[sizeof(active_csv_filename) - 1] = '\0';
 				k_mutex_unlock(&csv_path_mutex);
 
 				printk("[SD Card] Opened/Rotated CSV log: %s\n", filepath);
 			} else {
+				fs_file_t_init(&g_csv_file);
+				g_csv_file_is_open = false;
 				k_mutex_unlock(&sdcard_fs_mutex);
 				printk("[SD Card] Failed to open CSV file %s (err %d)\n", filepath, res);
 			}
 		}
 
 		/* Append telemetry record */
+		k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 		if (g_csv_file_is_open) {
 			char line[128];
 			int len = snprintf(line, sizeof(line), "%s,%lld,%u,%u,%d.%d,%u.%02u,%d\n",
@@ -833,14 +832,13 @@ static void sdcard_csv_thread_fn(void *p1, void *p2, void *p3)
 			                   packet.current_ma);
 
 			if (len > 0) {
-				k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
 				fs_write(&g_csv_file, line, len);
 				if (packet.sample_id % CONFIG_APP_SAMPLE_RATE_HZ == 0) {
 					fs_sync(&g_csv_file);
 				}
-				k_mutex_unlock(&sdcard_fs_mutex);
 			}
 		}
+		k_mutex_unlock(&sdcard_fs_mutex);
 	}
 }
 
@@ -1256,6 +1254,27 @@ static bool get_query_param_str(const char *req, const char *param, char *out_bu
 	return (idx > 0);
 }
 
+static void system_perform_reboot(void)
+{
+	/* 1. Flush any pending CSV records to SD Card */
+	sdcard_flush_sync();
+
+	/* 2. Stop remote APP_CPU motor / PWM before reset */
+	if (ipm_dev && device_is_ready(ipm_dev)) {
+		ipm_pwm_ctrl_t cmd = {
+			.action = PWM_ACTION_STOP_PROFILE,
+			.manual_pwm = 0,
+		};
+		ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
+	}
+
+	printk("[System] Reboot requested! Restarting SoC...\n");
+	k_msleep(200);
+
+	/* 3. Standard Zephyr clean cold reboot */
+	sys_reboot(SYS_REBOOT_COLD);
+}
+
 static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -1590,10 +1609,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							if (is_today) {
 								if (g_csv_file_is_open) {
 									fs_close(&g_csv_file);
+									fs_file_t_init(&g_csv_file);
 									g_csv_file_is_open = false;
 								}
 								fs_unlink(fullpath);
-								int res = fs_open(&g_csv_file, fullpath, FS_O_CREATE | FS_O_WRITE);
+								int res = fs_open(&g_csv_file, fullpath, FS_O_CREATE | FS_O_WRITE | FS_O_APPEND);
 								if (res == 0) {
 									const char *hdr = "timestamp_iso,uptime_ms,sample_id,rpm,temp_c,bus_volt_v,curr_ma\n";
 									fs_write(&g_csv_file, hdr, strlen(hdr));
@@ -1602,6 +1622,10 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 									success = true;
 									recreated = true;
 									printk("[HTTP] Recreated active today CSV: %s\n", fullpath);
+								} else {
+									fs_file_t_init(&g_csv_file);
+									g_csv_file_is_open = false;
+									printk("[HTTP] Failed to recreate active CSV %s (err %d)\n", fullpath, res);
 								}
 							} else {
 								int ures = fs_unlink(fullpath);
@@ -1657,7 +1681,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							g_active_profile_cfg.action = PWM_ACTION_SET_CONFIG_ONLY;
 
 							if (ipm_dev && device_is_ready(ipm_dev)) {
-								ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+								ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 							}
 						}
 
@@ -1735,7 +1759,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						}
 						g_active_profile_cfg.action = PWM_ACTION_START_PROFILE;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 						}
 						const char *resp =
 							"HTTP/1.1 200 OK\r\n"
@@ -1754,7 +1778,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					          strstr(rx_buf, "action=stop"))) {
 						g_active_profile_cfg.action = PWM_ACTION_STOP_PROFILE;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 						}
 						const char *resp =
 							"HTTP/1.1 200 OK\r\n"
@@ -1778,7 +1802,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							.manual_pwm = (uint8_t)target_val,
 						};
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 0, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
+							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
 						}
 						char body[64];
 						int blen = snprintf(body, sizeof(body), "{\"status\":\"ok\",\"pwm\":%d}\r\n", target_val);
@@ -1805,12 +1829,10 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							"Connection: close\r\n\r\n"
 							"{\"status\":\"rebooting\"}\r\n";
 						send_all(client_fd, resp, strlen(resp));
+						k_msleep(50);
 						close(client_fd);
 
-						sdcard_flush_sync();
-						printk("[System] Reboot requested! Restarting SoC in 500ms...\n");
-						k_msleep(500);
-						sys_reboot(SYS_REBOOT_COLD);
+						system_perform_reboot();
 					}
 					/* 404 for unknown endpoints */
 					else {
