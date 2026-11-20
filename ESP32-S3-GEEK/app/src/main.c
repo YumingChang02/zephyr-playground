@@ -91,22 +91,6 @@
 /* Devicetree IPM node */
 static const struct device *ipm_dev;
 
-/* Full telemetry record with wall-clock time added by PRO_CPU */
-typedef struct {
-	uint32_t sample_id;
-	uint32_t motor_rpm;
-	int32_t  temp_mc;              /* milli-Celsius (e.g. 42100 = 42.1 C) */
-	uint32_t bus_mv;               /* milli-Volts (e.g. 12050 = 12.05 V)  */
-	int32_t  current_ma;           /* milli-Amps (signed, e.g. -85 .. 250 mA) */
-	int64_t  uptime_ms;
-	uint8_t  pwm_pct;
-	uint8_t  profile_stage;
-	uint16_t profile_elapsed_sec;
-	uint16_t profile_total_sec;
-	char     iso_time[32];         /* "YYYY-MM-DDTHH:MM:SSZ"              */
-	char     date_str[16];         /* "YYYY-MM-DD"                        */
-} telemetry_full_t;
-
 /* Active 4-stage PWM Profile Configuration */
 static ipm_pwm_ctrl_t g_active_profile_cfg = {
 	.t_low_sec = DEFAULT_PROF_T_LOW,
@@ -408,23 +392,23 @@ static const char HTTP_HTML_PAGE[] =
 "<div class=\"card\"><div class=\"label\">Current</div><div class=\"val\"><span id=\"v-curr\">--</span> <small style=\"font-size:0.7rem;font-weight:400\">mA</small></div></div>"
 "</div>"
 "<div class=\"box\">"
-"<div class=\"box-title\">Motor RPM History (0 &ndash; 5500 RPM Scale)</div>"
+"<div class=\"box-title\">Motor RPM History (0 &ndash; " STRINGIFY(CONFIG_APP_MAX_FG_RPM) " RPM Scale)</div>"
 "<canvas id=\"c-rpm\"></canvas>"
 "</div>"
 "<div class=\"box\">"
-"<div class=\"box-title\">Voltage & Current History</div>"
+"<div class=\"box-title\">Voltage & Current History (Current 0 &ndash; " STRINGIFY(APP_MAX_CURRENT_MA) " mA)</div>"
 "<canvas id=\"c-pwr\"></canvas>"
 "</div>"
 "<div class=\"box\">"
 "<div class=\"box-title\">4-Stage PWM Profile Curve (Low &rarr; Ramp Up &rarr; High &rarr; Drop)</div>"
 "<canvas id=\"c-curve\" style=\"height:130px;margin-bottom:10px\"></canvas>"
 "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px\">"
-"<div><div class=\"label\">1. Low Time (s)</div><input id=\"t-low\" type=\"number\" min=\"0\" max=\"32768\" value=\"410\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
-"<div><div class=\"label\">Target Low PWM (%)</div><input id=\"p-low\" type=\"number\" min=\"0\" max=\"100\" value=\"0\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
-"<div><div class=\"label\">2. Ramp Up Time (s)</div><input id=\"t-up\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
-"<div><div class=\"label\">3. High Time (s)</div><input id=\"t-high\" type=\"number\" min=\"0\" max=\"32768\" value=\"170\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
-"<div><div class=\"label\">Target High PWM (%)</div><input id=\"p-high\" type=\"number\" min=\"0\" max=\"100\" value=\"90\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
-"<div><div class=\"label\">4. Drop Time (s)</div><input id=\"t-drop\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">1. Low Time (s)</div><input id=\"t-low\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_LOW) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Target Low PWM (%)</div><input id=\"p-low\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_PROF_P_LOW) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">2. Ramp Up Time (s)</div><input id=\"t-up\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_UP) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">3. High Time (s)</div><input id=\"t-high\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_HIGH) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Target High PWM (%)</div><input id=\"p-high\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_PROF_P_HIGH) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">4. Drop Time (s)</div><input id=\"t-drop\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_DROP) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
 "</div>"
 "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\">"
 "<button id=\"btn-run\" onclick=\"startProfile()\" style=\"padding:6px 16px;background:#2e7d32;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer\">&#x25B6; Run Profile (Loop)</button>"
@@ -467,13 +451,13 @@ static const char HTTP_HTML_PAGE[] =
 "xR.clearRect(0,0,wR,hR);xP.clearRect(0,0,wP,hP);"
 "drawGrid(xR,wR,hR);drawGrid(xP,wP,hP);"
 "if(pts.length<2)return;"
-"let maxR=5500;pts.forEach(p=>{if(p.rpm>maxR)maxR=p.rpm;});"
+"let maxR=" STRINGIFY(CONFIG_APP_MAX_FG_RPM) ";pts.forEach(p=>{if(p.rpm>maxR)maxR=p.rpm;});"
 "xR.fillStyle='#666';xR.font=(9*window.devicePixelRatio)+'px sans-serif';"
 "xR.fillText(maxR+' RPM',6,12*window.devicePixelRatio);"
 "xR.fillText('0 RPM',6,hR-4);"
 "xR.strokeStyle='#4fc3f7';xR.lineWidth=2*window.devicePixelRatio;xR.beginPath();"
 "pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wR;const y=hR-(Math.min(p.rpm,maxR)/maxR)*hR;if(i===0)xR.moveTo(x,y);else xR.lineTo(x,y);});xR.stroke();"
-"let maxV=15,minI=0,maxI=250;pts.forEach(p=>{if(p.volt>maxV)maxV=p.volt;if(p.curr>maxI)maxI=p.curr;if(p.curr<minI)minI=p.curr;});"
+"let maxV=15,minI=0,maxI=" STRINGIFY(APP_MAX_CURRENT_MA) ";pts.forEach(p=>{if(p.volt>maxV)maxV=p.volt;if(p.curr>maxI)maxI=p.curr;if(p.curr<minI)minI=p.curr;});"
 "const spanI=(maxI-minI)||1;"
 "xP.fillStyle='#81c784';xP.font=(9*window.devicePixelRatio)+'px sans-serif';xP.fillText(maxV+' V',6,12*window.devicePixelRatio);"
 "xP.fillStyle='#ffb74d';xP.fillText(maxI+' mA',wP-(55*window.devicePixelRatio),12*window.devicePixelRatio);"

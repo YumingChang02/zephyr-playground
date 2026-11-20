@@ -4,6 +4,11 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#ifndef STRINGIFY
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x)        STRINGIFY_HELPER(x)
+#endif
+
 /* Profile Actions */
 #define PWM_ACTION_SET_CONFIG_ONLY  0
 #define PWM_ACTION_START_PROFILE    1
@@ -45,6 +50,10 @@ typedef struct {
 	char     date_str[16];
 } telemetry_full_t;
 
+#ifndef CONFIG_APP_MAX_FG_RPM
+#define CONFIG_APP_MAX_FG_RPM 5500
+#endif
+
 #define DEFAULT_PROF_T_LOW   410
 #define DEFAULT_PROF_P_LOW   0
 #define DEFAULT_PROF_T_UP    10
@@ -53,7 +62,7 @@ typedef struct {
 #define DEFAULT_PROF_T_DROP  10
 #define DEFAULT_PROF_TOTAL   (DEFAULT_PROF_T_LOW + DEFAULT_PROF_T_UP + DEFAULT_PROF_T_HIGH + DEFAULT_PROF_T_DROP)
 
-#define APP_MAX_CURRENT_MA   250
+#define APP_MAX_CURRENT_MA   150
 
 typedef struct __attribute__((packed)) {
 	uint16_t t_low_sec;
@@ -65,5 +74,7 @@ typedef struct __attribute__((packed)) {
 	uint8_t  action;               /* PWM_ACTION_*                        */
 	uint8_t  manual_pwm;           /* 0..100% when action == PWM_ACTION_MANUAL_PWM */
 } pwm_profile_ctrl_t;
+
+typedef pwm_profile_ctrl_t ipm_pwm_ctrl_t;
 
 #endif /* TELEMETRY_H_ */

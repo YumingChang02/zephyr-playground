@@ -460,11 +460,11 @@ static void sensor_aggregator_thread_fn(void *arg1, void *arg2, void *arg3)
 				current_ma = (int32_t)(i_shunt.val1 * 1000 + i_shunt.val2 / 1000);
 			} else {
 				bus_mv = 12000 + prng_range(0, 100);
-				current_ma = 150 + (int32_t)prng_range(0, 20);
+				current_ma = (APP_MAX_CURRENT_MA * 6 / 10) + (int32_t)prng_range(0, (APP_MAX_CURRENT_MA / 10) ? (APP_MAX_CURRENT_MA / 10) : 1);
 			}
 		} else {
 			bus_mv = 12000 + prng_range(0, 100);
-			current_ma = 100 + (int32_t)((speed_sample.rpm * 120) / CONFIG_APP_MAX_FG_RPM) + (int32_t)prng_range(0, 10);
+			current_ma = (int32_t)((speed_sample.rpm * (APP_MAX_CURRENT_MA * 8 / 10)) / CONFIG_APP_MAX_FG_RPM) + (int32_t)prng_range(0, 5);
 		}
 
 		/* Dynamic EMA smoothing for current (mA) scaled to CONFIG_APP_SAMPLE_RATE_HZ */
@@ -777,7 +777,7 @@ static void display_thread_fn(void *arg1, void *arg2, void *arg3)
 	/* Bar colors (RGB565) */
 	uint16_t color_pwm   = rgb565(0, 63, 31); /* Top: Cyan (PWM Target %) */
 	uint16_t color_fg    = rgb565(0, 63, 0);  /* Mid: Vibrant Green (FG RPM %) */
-	uint16_t color_curr  = rgb565(31, 40, 0); /* Bot: Orange/Amber (Current mA %, max 250mA) */
+	uint16_t color_curr  = rgb565(31, 40, 0); /* Bot: Orange/Amber (Current mA %, max APP_MAX_CURRENT_MA) */
 
 	static uint32_t s_smooth_pwm = 0;
 	static uint32_t s_smooth_fg = 0;

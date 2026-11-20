@@ -2,6 +2,12 @@
 #define TELEMETRY_H_
 
 #include <stdint.h>
+#include <stdbool.h>
+
+#ifndef STRINGIFY
+#define STRINGIFY_HELPER(x) #x
+#define STRINGIFY(x)        STRINGIFY_HELPER(x)
+#endif
 
 #define IPM_CHANNEL_APP_TELEMETRY   2   /* ESP32 IPM Channels 0 & 1 reserved for BT/WiFi */
 #define IPM_CHANNEL_APP_PRINT       3   /* IPC printk channel from APP_CPU to PRO_CPU */
@@ -36,6 +42,22 @@ typedef struct __attribute__((packed)) {
 	uint16_t profile_total_sec;    /* total duration of 4 stages in sec   */
 } telemetry_packet_t;
 
+/* Full telemetry record with wall-clock time added by PRO_CPU */
+typedef struct {
+	uint32_t sample_id;
+	uint32_t motor_rpm;
+	int32_t  temp_mc;              /* milli-Celsius (e.g. 42100 = 42.1 C) */
+	uint32_t bus_mv;               /* milli-Volts (e.g. 12050 = 12.05 V)  */
+	int32_t  current_ma;           /* milli-Amps (signed, e.g. -85 .. 250 mA) */
+	int64_t  uptime_ms;
+	uint8_t  pwm_pct;
+	uint8_t  profile_stage;
+	uint16_t profile_elapsed_sec;
+	uint16_t profile_total_sec;
+	char     iso_time[32];         /* "YYYY-MM-DDTHH:MM:SSZ"              */
+	char     date_str[16];         /* "YYYY-MM-DD"                        */
+} telemetry_full_t;
+
 typedef struct __attribute__((packed)) {
 	char msg[IPC_PRINT_MAX_LEN];
 } ipc_print_packet_t;
@@ -51,6 +73,10 @@ typedef struct __attribute__((packed)) {
 	uint32_t sec_of_day;
 } ipm_time_sync_t;
 
+#ifndef CONFIG_APP_MAX_FG_RPM
+#define CONFIG_APP_MAX_FG_RPM 5500
+#endif
+
 #define DEFAULT_PROF_T_LOW   410
 #define DEFAULT_PROF_P_LOW   0
 #define DEFAULT_PROF_T_UP    10
@@ -59,7 +85,7 @@ typedef struct __attribute__((packed)) {
 #define DEFAULT_PROF_T_DROP  10
 #define DEFAULT_PROF_TOTAL   (DEFAULT_PROF_T_LOW + DEFAULT_PROF_T_UP + DEFAULT_PROF_T_HIGH + DEFAULT_PROF_T_DROP)
 
-#define APP_MAX_CURRENT_MA   250
+#define APP_MAX_CURRENT_MA   150
 
 typedef struct __attribute__((packed)) {
 	uint16_t t_low_sec;
@@ -71,5 +97,7 @@ typedef struct __attribute__((packed)) {
 	uint8_t  action;               /* PWM_ACTION_*                        */
 	uint8_t  manual_pwm;           /* 0..100% when action == PWM_ACTION_MANUAL_PWM */
 } ipm_pwm_ctrl_t;
+
+typedef ipm_pwm_ctrl_t pwm_profile_ctrl_t;
 
 #endif /* TELEMETRY_H_ */

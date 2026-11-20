@@ -491,7 +491,7 @@ static void sensor_aggregator_thread_fn(void *p1, void *p2, void *p3)
 			}
 		} else {
 			/* Simulation proportional to speed */
-			current_ma = 100 + (int32_t)((speed.rpm * 120) / CONFIG_APP_MAX_FG_RPM);
+			current_ma = (int32_t)((speed.rpm * (APP_MAX_CURRENT_MA * 8 / 10)) / CONFIG_APP_MAX_FG_RPM);
 			bus_mv = 12050 - (speed.rpm / 200);
 			temp_mc = 38500 + (speed.rpm * 2);
 		}
@@ -1140,18 +1140,18 @@ static const char INDEX_HTML[] =
 "<div class=\"card\"><div class=\"card-title\">Temperature</div><div class=\"card-val\"><span id=\"v-temp\">0.0</span> <span class=\"unit\">&deg;C</span></div></div>"
 "<div class=\"card\"><div class=\"card-title\">Active Stage</div><div class=\"card-val\"><span id=\"v-stage\" style=\"font-size:1.0rem\">Idle</span></div></div>"
 "</div>"
-"<div class=\"box\"><div class=\"box-title\">RPM Speed History</div><canvas id=\"c-rpm\"></canvas></div>"
-"<div class=\"box\"><div class=\"box-title\">Current History (mA)</div><canvas id=\"c-curr\"></canvas></div>"
+"<div class=\"box\"><div class=\"box-title\">RPM Speed History (0 &ndash; " STRINGIFY(CONFIG_APP_MAX_FG_RPM) " RPM Scale)</div><canvas id=\"c-rpm\"></canvas></div>"
+"<div class=\"box\"><div class=\"box-title\">Current History (0 &ndash; " STRINGIFY(APP_MAX_CURRENT_MA) " mA)</div><canvas id=\"c-curr\"></canvas></div>"
 "<div class=\"box\">"
 "<div class=\"box-title\">4-Stage PWM Profile Curve (Low &rarr; Ramp Up &rarr; High &rarr; Drop)</div>"
 "<canvas id=\"c-curve\" style=\"height:120px;margin-bottom:10px\"></canvas>"
 "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px\">"
-"<div><div class=\"label\">1. Low Time (s)</div><input id=\"t-low\" type=\"number\" min=\"0\" max=\"32768\" value=\"410\"></div>"
-"<div><div class=\"label\">Target Low PWM (%)</div><input id=\"p-low\" type=\"number\" min=\"0\" max=\"100\" value=\"0\"></div>"
-"<div><div class=\"label\">2. Ramp Up Time (s)</div><input id=\"t-up\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\"></div>"
-"<div><div class=\"label\">3. High Time (s)</div><input id=\"t-high\" type=\"number\" min=\"0\" max=\"32768\" value=\"170\"></div>"
-"<div><div class=\"label\">Target High PWM (%)</div><input id=\"p-high\" type=\"number\" min=\"0\" max=\"100\" value=\"90\"></div>"
-"<div><div class=\"label\">4. Drop Time (s)</div><input id=\"t-drop\" type=\"number\" min=\"0\" max=\"32768\" value=\"10\"></div>"
+"<div><div class=\"label\">1. Low Time (s)</div><input id=\"t-low\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_LOW) "\"></div>"
+"<div><div class=\"label\">Target Low PWM (%)</div><input id=\"p-low\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_PROF_P_LOW) "\"></div>"
+"<div><div class=\"label\">2. Ramp Up Time (s)</div><input id=\"t-up\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_UP) "\"></div>"
+"<div><div class=\"label\">3. High Time (s)</div><input id=\"t-high\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_HIGH) "\"></div>"
+"<div><div class=\"label\">Target High PWM (%)</div><input id=\"p-high\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_PROF_P_HIGH) "\"></div>"
+"<div><div class=\"label\">4. Drop Time (s)</div><input id=\"t-drop\" type=\"number\" min=\"0\" max=\"32768\" value=\"" STRINGIFY(DEFAULT_PROF_T_DROP) "\"></div>"
 "</div>"
 "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\">"
 "<button onclick=\"startProfile()\">&#x25B6; Run Profile (Loop)</button>"
@@ -1174,11 +1174,11 @@ static const char INDEX_HTML[] =
 "xR.clearRect(0,0,wR,hR);xC.clearRect(0,0,wC,hC);"
 "drawGrid(xR,wR,hR);drawGrid(xC,wC,hC);"
 "if(pts.length<2)return;"
-"let maxR=5500;pts.forEach(p=>{if(p.rpm>maxR)maxR=p.rpm;});"
+"let maxR=" STRINGIFY(CONFIG_APP_MAX_FG_RPM) ";pts.forEach(p=>{if(p.rpm>maxR)maxR=p.rpm;});"
 "xR.strokeStyle='#00e676';xR.lineWidth=2;xR.beginPath();"
 "pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wR;const y=hR-(p.rpm/maxR)*hR;if(i===0)xR.moveTo(x,y);else xR.lineTo(x,y);});"
 "xR.stroke();"
-"let maxC=250;pts.forEach(p=>{if(Math.abs(p.curr)>maxC)maxC=Math.abs(p.curr);});"
+"let maxC=" STRINGIFY(APP_MAX_CURRENT_MA) ";pts.forEach(p=>{if(Math.abs(p.curr)>maxC)maxC=Math.abs(p.curr);});"
 "xC.strokeStyle='#ff9100';xC.lineWidth=2;xC.beginPath();"
 "pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wC;const y=hC-((p.curr+maxC)/(maxC*2))*hC;if(i===0)xC.moveTo(x,y);else xC.lineTo(x,y);});"
 "xC.stroke();"
