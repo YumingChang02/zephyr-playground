@@ -34,6 +34,7 @@
 #include "telemetry.h"
 
 static const struct device *ipm_dev;
+static K_MUTEX_DEFINE(app_printk_mutex);
 
 static void app_printk(const char *fmt, ...)
 {
@@ -56,7 +57,13 @@ static void app_printk(const char *fmt, ...)
 			send_len = sizeof(pkt.msg);
 			pkt.msg[sizeof(pkt.msg) - 1] = '\0';
 		}
-		ipm_send(ipm_dev, 0, IPM_CHANNEL_APP_PRINT, pkt.msg, (int)send_len);
+		if (k_is_in_isr()) {
+			ipm_send(ipm_dev, 0, IPM_CHANNEL_APP_PRINT, pkt.msg, (int)send_len);
+		} else {
+			k_mutex_lock(&app_printk_mutex, K_FOREVER);
+			ipm_send(ipm_dev, 1, IPM_CHANNEL_APP_PRINT, pkt.msg, (int)send_len);
+			k_mutex_unlock(&app_printk_mutex);
+		}
 	}
 }
 
@@ -131,6 +138,9 @@ static volatile uint16_t g_prof_elapsed_sec = 0;
 static volatile uint16_t g_prof_total_sec = DEFAULT_PROF_TOTAL;
 static volatile uint32_t g_active_pwm_pct = 0;
 static volatile bool     g_prof_log_pending = false;
+static volatile uint32_t g_prof_ctrl_rx_count = 0;
+static volatile uint8_t  g_last_ctrl_action = 0xFF;
+static volatile uint8_t  g_last_ctrl_manual_pwm = 0;
 
 static void app_ipm_callback(const struct device *dev, void *user_data,
                              uint32_t id, volatile void *data)
@@ -151,6 +161,9 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 		g_time_sync_uptime_ms = k_uptime_get();
 	} else if (id == IPM_CHANNEL_PWM_CTRL && data != NULL) {
 		const ipm_pwm_ctrl_t *ctrl = (const ipm_pwm_ctrl_t *)data;
+		g_prof_ctrl_rx_count++;
+		g_last_ctrl_action = ctrl->action;
+		g_last_ctrl_manual_pwm = ctrl->manual_pwm;
 		if (ctrl->action == PWM_ACTION_SET_CONFIG_ONLY) {
 			/* Live on-the-fly curve reconfiguration while running or idle */
 			g_prof_cfg.t_low_sec = ctrl->t_low_sec;
@@ -163,7 +176,14 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 			g_prof_log_pending = true;
 		} else if (ctrl->action == PWM_ACTION_START_PROFILE) {
 			/* Start / Resume continuous profile loop */
-			g_prof_cfg = *ctrl;
+			g_prof_cfg.t_low_sec = ctrl->t_low_sec;
+			g_prof_cfg.t_up_sec = ctrl->t_up_sec;
+			g_prof_cfg.t_high_sec = ctrl->t_high_sec;
+			g_prof_cfg.t_drop_sec = ctrl->t_drop_sec;
+			g_prof_cfg.p_low_pct = ctrl->p_low_pct;
+			g_prof_cfg.p_high_pct = ctrl->p_high_pct;
+			g_prof_cfg.action = ctrl->action;
+			g_prof_cfg.manual_pwm = ctrl->manual_pwm;
 			g_prof_total_sec = ctrl->t_low_sec + ctrl->t_up_sec + ctrl->t_high_sec + ctrl->t_drop_sec;
 			g_prof_stage = PROFILE_STAGE_LOW;
 			g_prof_log_pending = true;
@@ -180,6 +200,8 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 			if (val > 100) val = 100;
 			g_active_pwm_pct = val;
 			g_disp_pwm_pct = val;
+			g_prof_log_pending = true;
+		} else {
 			g_prof_log_pending = true;
 		}
 	}
@@ -263,22 +285,43 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 			elapsed_ms = 1;
 		}
 
-		if (g_prof_log_pending) {
-			g_prof_log_pending = false;
-			printk("[APP_CPU] Profile Action: stage=%u, low=%u%% (%us), up=(%us), high=%u%% (%us), drop=(%us), total=%us\n",
-			       g_prof_stage, g_prof_cfg.p_low_pct, g_prof_cfg.t_low_sec, g_prof_cfg.t_up_sec,
-			       g_prof_cfg.p_high_pct, g_prof_cfg.t_high_sec, g_prof_cfg.t_drop_sec, g_prof_total_sec);
+		/* Atomic snapshot of IPM-updated profile and time state */
+		unsigned int irq_key = irq_lock();
+		bool log_pending = g_prof_log_pending;
+		g_prof_log_pending = false;
+		uint32_t ctrl_rx_cnt = g_prof_ctrl_rx_count;
+		uint8_t last_action = g_last_ctrl_action;
+		uint8_t last_manual = g_last_ctrl_manual_pwm;
+		uint8_t prof_stage = g_prof_stage;
+		uint32_t active_pwm_snap = g_active_pwm_pct;
+		uint32_t t1 = g_prof_cfg.t_low_sec;
+		uint32_t t2 = g_prof_cfg.t_up_sec;
+		uint32_t t3 = g_prof_cfg.t_high_sec;
+		uint32_t t4 = g_prof_cfg.t_drop_sec;
+		uint32_t pL = g_prof_cfg.p_low_pct;
+		uint32_t pH = g_prof_cfg.p_high_pct;
+		bool time_synced = g_time_synced;
+		uint32_t time_sec_of_day = g_time_sec_of_day;
+		uint16_t time_ms_part = g_time_ms_part;
+		int64_t time_sync_uptime_ms = g_time_sync_uptime_ms;
+		irq_unlock(irq_key);
+
+		if (log_pending) {
+			const char *act_str = "UNKNOWN";
+			if (last_action == PWM_ACTION_SET_CONFIG_ONLY) act_str = "SET_CFG";
+			else if (last_action == PWM_ACTION_START_PROFILE) act_str = "START";
+			else if (last_action == PWM_ACTION_STOP_PROFILE) act_str = "STOP";
+			else if (last_action == PWM_ACTION_MANUAL_PWM) act_str = "MANUAL";
+			printk("[APP_CPU] IPM PWM Ctrl #%u (%s, man=%u%%): stage=%u, low=%u%%(%us), up=%us, high=%u%%(%us), drop=%us, total=%us\n",
+			       ctrl_rx_cnt, act_str, last_manual, prof_stage,
+			       pL, t1, t2, pH, t3, t4, t1 + t2 + t3 + t4);
 		}
 
 		/* Evaluate autonomous looping 4-stage profile curve aligned to 00:00:00 */
+		static uint8_t s_prev_stage = 0xFF;
+		uint32_t cur_sec_of_day = 0;
 		uint32_t target_duty = 0;
-		if (g_prof_stage != PROFILE_STAGE_IDLE) {
-			uint32_t t1 = g_prof_cfg.t_low_sec;
-			uint32_t t2 = g_prof_cfg.t_up_sec;
-			uint32_t t3 = g_prof_cfg.t_high_sec;
-			uint32_t t4 = g_prof_cfg.t_drop_sec;
-			uint32_t pL = g_prof_cfg.p_low_pct;
-			uint32_t pH = g_prof_cfg.p_high_pct;
+		if (prof_stage != PROFILE_STAGE_IDLE) {
 			uint32_t total = t1 + t2 + t3 + t4;
 			g_prof_total_sec = (uint16_t)total;
 
@@ -289,15 +332,14 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 				target_duty = pL;
 			} else {
 				/* Compute wall-clock aligned time relative to 00:00:00 if synced, else uptime */
-				uint32_t cur_sec_of_day;
 				uint32_t cur_sub_ms;
-				if (g_time_synced) {
-					int64_t ms_since_sync = now_ms - g_time_sync_uptime_ms;
+				if (time_synced) {
+					int64_t ms_since_sync = now_ms - time_sync_uptime_ms;
 					if (ms_since_sync < 0) {
 						ms_since_sync = 0;
 					}
-					uint64_t total_day_ms = (uint64_t)g_time_sec_of_day * 1000ULL +
-					                        (uint64_t)g_time_ms_part +
+					uint64_t total_day_ms = (uint64_t)time_sec_of_day * 1000ULL +
+					                        (uint64_t)time_ms_part +
 					                        (uint64_t)ms_since_sync;
 					cur_sec_of_day = (uint32_t)((total_day_ms / 1000ULL) % 86400ULL);
 					cur_sub_ms = (uint32_t)(total_day_ms % 1000ULL);
@@ -312,10 +354,10 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 
 				/* Evaluate 4-stage profile: Low -> Ramp Up -> High -> Drop */
 				if (elapsed_sec < t1) {
-					g_prof_stage = PROFILE_STAGE_LOW;
+					prof_stage = PROFILE_STAGE_LOW;
 					target_duty = pL;
 				} else if (elapsed_sec < t1 + t2) {
-					g_prof_stage = PROFILE_STAGE_UP;
+					prof_stage = PROFILE_STAGE_UP;
 					uint32_t ramp_total_ms = t2 * 1000U;
 					uint32_t dt_ms = (elapsed_sec - t1) * 1000U + cur_sub_ms;
 					if (dt_ms > ramp_total_ms) {
@@ -327,10 +369,10 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 						target_duty = pL - (ramp_total_ms > 0 ? ((pL - pH) * dt_ms) / ramp_total_ms : (pL - pH));
 					}
 				} else if (elapsed_sec < t1 + t2 + t3) {
-					g_prof_stage = PROFILE_STAGE_HIGH;
+					prof_stage = PROFILE_STAGE_HIGH;
 					target_duty = pH;
 				} else {
-					g_prof_stage = PROFILE_STAGE_DROP;
+					prof_stage = PROFILE_STAGE_DROP;
 					uint32_t drop_total_ms = t4 * 1000U;
 					uint32_t dt_ms = (elapsed_sec - (t1 + t2 + t3)) * 1000U + cur_sub_ms;
 					if (dt_ms > drop_total_ms) {
@@ -342,9 +384,17 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 						target_duty = pH + (drop_total_ms > 0 ? ((pL - pH) * dt_ms) / drop_total_ms : (pL - pH));
 					}
 				}
+				g_prof_stage = prof_stage;
 			}
 		} else {
-			target_duty = g_active_pwm_pct;
+			target_duty = active_pwm_snap;
+		}
+
+		if (prof_stage != s_prev_stage) {
+			printk("[APP_CPU] PWM Stage: %u -> %u (elapsed=%u/%us, target=%u%%, synced=%d, sod=%u)\n",
+			       s_prev_stage, prof_stage, g_prof_elapsed_sec, g_prof_total_sec,
+			       target_duty, time_synced ? 1 : 0, cur_sec_of_day);
+			s_prev_stage = prof_stage;
 		}
 
 		if (target_duty > 100) {
@@ -353,22 +403,33 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 
 		static uint32_t s_applied_pwm_pct = 0xFFFFFFFF;
 		if (target_duty != s_applied_pwm_pct) {
-			s_applied_pwm_pct = target_duty;
 			g_active_pwm_pct = target_duty;
+			g_disp_pwm_pct = target_duty;
 			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
 				uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
 				int ret = pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
 				uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
 				uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
 				uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+				if (ret == 0) {
+					s_applied_pwm_pct = target_duty;
+				}
 				printk("[APP_CPU] PWM HW Apply: target=%u%% (pulse=%u ns) -> ret=%d [LEDC reg: duty=%u, sig_en=%u, idle_lv=%u]\n",
 				       target_duty, pulse_ns, ret, hw_duty, sig_en, idle_lv);
 			} else {
 				printk("[APP_CPU] PWM ERROR: pwm_motor device NOT ready!\n");
 			}
-			g_disp_pwm_pct = target_duty;
 		}
 		duty_cycle_pct = g_active_pwm_pct;
+
+		if ((sample_loop_cnt % (CONFIG_APP_SAMPLE_RATE_HZ * 2)) == 0) {
+			uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
+			uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+			uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+			printk("[APP_CPU] PWM Debug: loop=%u stage=%u (%u/%us) target=%u%% applied=%u%% rx=%u [LEDC duty=%u sig=%u idle=%u]\n",
+			       sample_loop_cnt, prof_stage, g_prof_elapsed_sec, g_prof_total_sec,
+			       target_duty, s_applied_pwm_pct, ctrl_rx_cnt, hw_duty, sig_en, idle_lv);
+		}
 
 		uint32_t delta_pulses;
 		if (fg_spec.port && device_is_ready(fg_spec.port)) {

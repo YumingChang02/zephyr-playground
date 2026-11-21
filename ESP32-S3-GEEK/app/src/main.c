@@ -110,7 +110,31 @@ typedef struct {
 
 /* Message Queues */
 K_MSGQ_DEFINE(csv_msgq, sizeof(telemetry_full_t), 8, 4);
-K_MSGQ_DEFINE(ipc_print_msgq, sizeof(ipc_print_packet_t), 16, 4);
+K_MSGQ_DEFINE(ipc_print_msgq, sizeof(ipc_print_packet_t), 32, 4);
+
+static inline void raw_console_printk(const char *s)
+{
+	printk("%s", s);
+}
+
+static void pro_printk(const char *fmt, ...)
+{
+	ipc_print_packet_t pkt;
+	va_list ap;
+	va_start(ap, fmt);
+	int len = vsnprintf(pkt.msg, sizeof(pkt.msg), fmt, ap);
+	va_end(ap);
+
+	if (len > 0) {
+		if ((size_t)len >= sizeof(pkt.msg)) {
+			pkt.msg[sizeof(pkt.msg) - 1] = '\0';
+		}
+		k_msgq_put(&ipc_print_msgq, &pkt, k_is_in_isr() ? K_NO_WAIT : K_MSEC(10));
+	}
+}
+
+#undef printk
+#define printk(fmt, ...) pro_printk(fmt, ##__VA_ARGS__)
 
 /* Synchronization between IPM and SSE server */
 static struct k_spinlock telemetry_spinlock;
@@ -1237,12 +1261,30 @@ static int get_query_param_int(const char *req, const char *param, int default_v
 {
 	char needle[32];
 	snprintf(needle, sizeof(needle), "%s=", param);
-	const char *p = strstr(req, needle);
-	if (!p) {
-		return default_val;
+	size_t nlen = strlen(needle);
+
+	/* Search in URL query string or POST body (after headers) */
+	const char *search_start = strstr(req, "\r\n\r\n");
+	const char *query_start = strchr(req, '?');
+	const char *scan = req;
+	if (query_start && (!search_start || query_start < search_start)) {
+		scan = query_start + 1;
+	} else if (search_start) {
+		scan = search_start + 4;
 	}
-	p += strlen(needle);
-	return atoi(p);
+
+	const char *p = strstr(scan, needle);
+	while (p) {
+		if (p == scan || p[-1] == '&' || p[-1] == '?' || p[-1] == '\n' || p[-1] == '\r') {
+			p += nlen;
+			if ((*p >= '0' && *p <= '9') || *p == '-') {
+				return atoi(p);
+			}
+			return default_val;
+		}
+		p = strstr(p + 1, needle);
+	}
+	return default_val;
 }
 
 static bool get_query_param_str(const char *req, const char *param, char *out_buf, size_t out_size)
@@ -1416,10 +1458,42 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 			int client_fd = accept(server_fd, (struct sockaddr *)&client_addr, &client_len);
 
 			if (client_fd >= 0) {
-				char rx_buf[512];
+				char rx_buf[1536];
 				int rlen = recv(client_fd, rx_buf, sizeof(rx_buf) - 1, 0);
 				if (rlen > 0) {
 					rx_buf[rlen] = '\0';
+
+					/* For POST requests, ensure headers + Content-Length body are fully received */
+					if (strncmp(rx_buf, "POST ", 5) == 0) {
+						int64_t rx_deadline = k_uptime_get() + 200;
+						while (rlen < (int)sizeof(rx_buf) - 1) {
+							char *hdr_end = strstr(rx_buf, "\r\n\r\n");
+							if (hdr_end) {
+								int hdr_len = (int)(hdr_end - rx_buf) + 4;
+								int content_len = 0;
+								const char *cl = strstr(rx_buf, "Content-Length:");
+								if (!cl) cl = strstr(rx_buf, "content-length:");
+								if (cl && cl < hdr_end) {
+									content_len = atoi(cl + 15);
+								}
+								if (rlen >= hdr_len + content_len) {
+									break;
+								}
+							}
+							if (k_uptime_get() >= rx_deadline) {
+								break;
+							}
+							struct zsock_pollfd rpfd = { .fd = client_fd, .events = ZSOCK_POLLIN };
+							if (poll(&rpfd, 1, 20) > 0) {
+								int more = recv(client_fd, rx_buf + rlen, sizeof(rx_buf) - 1 - rlen, 0);
+								if (more <= 0) {
+									break;
+								}
+								rlen += more;
+								rx_buf[rlen] = '\0';
+							}
+						}
+					}
 
 					/* Match OPTIONS (CORS preflight) */
 					if (strncmp(rx_buf, "OPTIONS", 7) == 0) {
@@ -1691,9 +1765,16 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							g_active_profile_cfg.t_drop_sec = (uint16_t)t_drop;
 							g_active_profile_cfg.action = PWM_ACTION_SET_CONFIG_ONLY;
 
+							int ipm_ret = -ENODEV;
 							if (ipm_dev && device_is_ready(ipm_dev)) {
-								ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+								ipm_ret = ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 							}
+							printk("[PRO_CPU] HTTP /api/profile/config: low=%u%%(%us) up=%us high=%u%%(%us) drop=%us ipm_ret=%d\n",
+							       g_active_profile_cfg.p_low_pct, g_active_profile_cfg.t_low_sec,
+							       g_active_profile_cfg.t_up_sec, g_active_profile_cfg.p_high_pct,
+							       g_active_profile_cfg.t_high_sec, g_active_profile_cfg.t_drop_sec, ipm_ret);
+						} else if (strncmp(rx_buf, "POST ", 5) == 0) {
+							printk("[PRO_CPU] WARNING: POST /api/profile/config missing t_low= (rlen=%d)\n", rlen);
 						}
 
 						char body[128];
@@ -1769,9 +1850,14 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							g_active_profile_cfg.t_drop_sec = (uint16_t)t_drop;
 						}
 						g_active_profile_cfg.action = PWM_ACTION_START_PROFILE;
+						int ipm_ret = -ENODEV;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+							ipm_ret = ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 						}
+						printk("[PRO_CPU] HTTP /api/profile/start: low=%u%%(%us) up=%us high=%u%%(%us) drop=%us ipm_ret=%d\n",
+						       g_active_profile_cfg.p_low_pct, g_active_profile_cfg.t_low_sec,
+						       g_active_profile_cfg.t_up_sec, g_active_profile_cfg.p_high_pct,
+						       g_active_profile_cfg.t_high_sec, g_active_profile_cfg.t_drop_sec, ipm_ret);
 						const char *resp =
 							"HTTP/1.1 200 OK\r\n"
 							"Content-Type: application/json\r\n"
@@ -1788,9 +1874,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					         ((strncmp(rx_buf, "POST /api/profile", 17) == 0 || strncmp(rx_buf, "GET /api/profile", 16) == 0) &&
 					          strstr(rx_buf, "action=stop"))) {
 						g_active_profile_cfg.action = PWM_ACTION_STOP_PROFILE;
+						int ipm_ret = -ENODEV;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
+							ipm_ret = ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &g_active_profile_cfg, sizeof(g_active_profile_cfg));
 						}
+						printk("[PRO_CPU] HTTP /api/profile/stop: ipm_ret=%d\n", ipm_ret);
 						const char *resp =
 							"HTTP/1.1 200 OK\r\n"
 							"Content-Type: application/json\r\n"
@@ -1812,9 +1900,11 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 							.action = PWM_ACTION_MANUAL_PWM,
 							.manual_pwm = (uint8_t)target_val,
 						};
+						int ipm_ret = -ENODEV;
 						if (ipm_dev && device_is_ready(ipm_dev)) {
-							ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
+							ipm_ret = ipm_send(ipm_dev, 1, IPM_CHANNEL_PWM_CTRL, &cmd, sizeof(cmd));
 						}
+						printk("[PRO_CPU] HTTP /api/pwm: val=%d%% ipm_ret=%d\n", target_val, ipm_ret);
 						char body[64];
 						int blen = snprintf(body, sizeof(body), "{\"status\":\"ok\",\"pwm\":%d}\r\n", target_val);
 						char header[160];
@@ -2010,7 +2100,7 @@ static void ipc_console_thread_fn(void *p1, void *p2, void *p3)
 
 	while (1) {
 		if (k_msgq_get(&ipc_print_msgq, &pkt, K_FOREVER) == 0) {
-			printk("%s", pkt.msg);
+			raw_console_printk(pkt.msg);
 		}
 	}
 }
