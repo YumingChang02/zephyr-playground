@@ -13,6 +13,7 @@
 #define IPM_CHANNEL_APP_PRINT       3   /* IPC printk channel from APP_CPU to PRO_CPU */
 #define IPM_CHANNEL_TIME_SYNC       4   /* IPC time sync channel from PRO_CPU to APP_CPU */
 #define IPM_CHANNEL_PWM_CTRL        5   /* IPC target PWM & 4-stage profile command */
+#define IPM_CHANNEL_THROTTLE_CTRL   6   /* IPC dry-run PWM throttle config */
 
 #define IPC_PRINT_MAX_LEN           192
 
@@ -40,6 +41,10 @@ typedef struct __attribute__((packed)) {
 	uint8_t  profile_stage;        /* PROFILE_STAGE_*                     */
 	uint16_t profile_elapsed_sec;  /* which second point is currently at  */
 	uint16_t profile_total_sec;    /* total duration of 4 stages in sec   */
+	uint8_t  throttle_active;      /* 0=normal, 1=throttling, 2=recovering */
+	uint8_t  throttle_drop_pct;    /* active PWM reduction 0..100%        */
+	uint16_t throttle_base_rpm;    /* armed baseline RPM (0=unarmed)      */
+	int16_t  throttle_base_ma;     /* armed baseline mA                   */
 } telemetry_packet_t;
 
 /* Full telemetry record with wall-clock time added by PRO_CPU */
@@ -54,6 +59,10 @@ typedef struct {
 	uint8_t  profile_stage;
 	uint16_t profile_elapsed_sec;
 	uint16_t profile_total_sec;
+	uint8_t  throttle_active;
+	uint8_t  throttle_drop_pct;
+	uint16_t throttle_base_rpm;
+	int16_t  throttle_base_ma;
 	char     iso_time[32];         /* "YYYY-MM-DDTHH:MM:SSZ"              */
 	char     date_str[16];         /* "YYYY-MM-DD"                        */
 } telemetry_full_t;
@@ -99,5 +108,25 @@ typedef struct __attribute__((packed)) {
 } ipm_pwm_ctrl_t;
 
 typedef ipm_pwm_ctrl_t pwm_profile_ctrl_t;
+
+#define DEFAULT_THROTTLE_ENABLED        0
+#define DEFAULT_THROTTLE_MAX_DROP_PCT   30
+#define DEFAULT_THROTTLE_SLOPE_PCT_S    5
+#define DEFAULT_THROTTLE_RPM_RISE_PCT   15
+#define DEFAULT_THROTTLE_CURR_DROP_PCT  20
+#define DEFAULT_THROTTLE_COOLDOWN_SEC   8
+
+#define THROTTLE_STATE_NORMAL           0
+#define THROTTLE_STATE_ACTIVE           1
+#define THROTTLE_STATE_RECOVERING       2
+
+typedef struct __attribute__((packed)) {
+	uint8_t  enabled;              /* 0 = disabled, 1 = enabled */
+	uint8_t  max_drop_pct;         /* X%: max PWM reduction (0..100%) */
+	uint8_t  slope_pct_per_sec;    /* Y%/s: ramp rate (1..100%/s) */
+	uint8_t  rpm_rise_pct;         /* RPM rise % vs baseline (1..200%) */
+	uint8_t  curr_drop_pct;        /* Current drop % vs baseline (1..100%) */
+	uint8_t  cooldown_sec;         /* Hold duration before recovery probe (1..120s) */
+} ipm_throttle_ctrl_t;
 
 #endif /* TELEMETRY_H_ */

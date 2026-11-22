@@ -103,6 +103,15 @@ static ipm_pwm_ctrl_t g_active_profile_cfg = {
 	.manual_pwm = 0,
 };
 
+static ipm_throttle_ctrl_t g_throttle_cfg = {
+	.enabled = DEFAULT_THROTTLE_ENABLED,
+	.max_drop_pct = DEFAULT_THROTTLE_MAX_DROP_PCT,
+	.slope_pct_per_sec = DEFAULT_THROTTLE_SLOPE_PCT_S,
+	.rpm_rise_pct = DEFAULT_THROTTLE_RPM_RISE_PCT,
+	.curr_drop_pct = DEFAULT_THROTTLE_CURR_DROP_PCT,
+	.cooldown_sec = DEFAULT_THROTTLE_COOLDOWN_SEC,
+};
+
 typedef struct {
 	int fd;
 	uint32_t last_sent_id;
@@ -341,6 +350,10 @@ static void ipm_receive_callback(const struct device *dev, void *user_data,
 		full_pkt.profile_stage = raw_pkt.profile_stage;
 		full_pkt.profile_elapsed_sec = raw_pkt.profile_elapsed_sec;
 		full_pkt.profile_total_sec = raw_pkt.profile_total_sec;
+		full_pkt.throttle_active = raw_pkt.throttle_active;
+		full_pkt.throttle_drop_pct = raw_pkt.throttle_drop_pct;
+		full_pkt.throttle_base_rpm = raw_pkt.throttle_base_rpm;
+		full_pkt.throttle_base_ma = raw_pkt.throttle_base_ma;
 
 		get_formatted_time(full_pkt.iso_time, sizeof(full_pkt.iso_time),
 		                   full_pkt.date_str, sizeof(full_pkt.date_str));
@@ -394,6 +407,7 @@ static const char HTTP_HTML_PAGE[] =
 "<span id=\"badge-ntp\" class=\"badge\">NTP: Syncing...</span>"
 "<span id=\"badge-sd\" class=\"badge ok\">SD: Logging</span>"
 "<span id=\"badge-amp\" class=\"badge ok\">AMP: IPM Active</span>"
+"<span id=\"badge-throt\" class=\"badge\">Dry-Run: Off</span>"
 "</div>"
 "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:#1e1e1e;padding:8px 12px;border-radius:6px;border:1px solid #333;margin-bottom:14px\">"
 "<span style=\"font-size:0.75rem;font-weight:600;color:#aaa\">&#x1F4BE; CSV Log:</span>"
@@ -440,6 +454,22 @@ static const char HTTP_HTML_PAGE[] =
 "<button id=\"btn-stop\" onclick=\"stopProfile()\" style=\"padding:6px 16px;background:#c62828;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer\">&#x23F9; Stop (0%)</button>"
 "<span id=\"prof-status\" style=\"font-size:0.8rem;color:#81c784\">Status: Loop Active</span>"
 "</div>"
+"</div>"
+"<div class=\"box\">"
+"<div class=\"box-title\">Dry-Run / Air-Draw PWM Throttling (Auto-Reduce PWM on RPM Rise + mA Drop)</div>"
+"<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px;align-items:end\">"
+"<div><label style=\"display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;padding:4px 0\"><input id=\"th-en\" type=\"checkbox\"> Enable Auto-Throttle</label></div>"
+"<div><div class=\"label\">Max PWM Drop X (%)</div><input id=\"th-drop\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_MAX_DROP_PCT) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Slope Y (%/s)</div><input id=\"th-slope\" type=\"number\" min=\"1\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_SLOPE_PCT_S) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">RPM Rise Trigger (%)</div><input id=\"th-rpm\" type=\"number\" min=\"1\" max=\"200\" value=\"" STRINGIFY(DEFAULT_THROTTLE_RPM_RISE_PCT) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Current Drop Trigger (%)</div><input id=\"th-curr\" type=\"number\" min=\"1\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_CURR_DROP_PCT) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"<div><div class=\"label\">Cooldown Hold (s)</div><input id=\"th-cd\" type=\"number\" min=\"1\" max=\"120\" value=\"" STRINGIFY(DEFAULT_THROTTLE_COOLDOWN_SEC) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
+"</div>"
+"<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap\">"
+"<button type=\"button\" onclick=\"saveThrottle()\" style=\"padding:6px 16px;background:#0288d1;color:#fff;border:none;border-radius:4px;font-weight:600;cursor:pointer\">Apply Throttle Config</button>"
+"<span id=\"throt-status\" style=\"font-size:0.8rem;color:#aaa\">Throttle: Disabled</span>"
+"</div>"
+"<div id=\"throt-diag\" style=\"font-size:0.75rem;color:#9e9e9e;margin-top:6px\"></div>"
 "</div>"
 "<div id=\"tip\"></div>"
 "<script>"
@@ -606,6 +636,28 @@ static const char HTTP_HTML_PAGE[] =
 "fetch('/api/profile/status').then(r=>r.json()).then(st=>{"
 "if(st.running)drawCurve(st.elapsed_sec);"
 "}).catch(e=>{});"
+"function saveThrottle(){"
+"const en=document.getElementById('th-en').checked?1:0;"
+"const md=parseInt(document.getElementById('th-drop').value)||0;"
+"const sl=parseInt(document.getElementById('th-slope').value)||1;"
+"const rr=parseInt(document.getElementById('th-rpm').value)||1;"
+"const cd=parseInt(document.getElementById('th-curr').value)||1;"
+"const co=parseInt(document.getElementById('th-cd').value)||1;"
+"fetch('/api/throttle/config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'enabled='+en+'&max_drop='+md+'&slope='+sl+'&rpm_rise='+rr+'&curr_drop='+cd+'&cooldown='+co})"
+".then(r=>r.json()).then(j=>{"
+"document.getElementById('throt-status').innerText=j.enabled?'Armed (-'+j.max_drop+'% @ '+j.slope+'%/s)':'Throttle: Disabled';"
+"}).catch(e=>{});"
+"}"
+"fetch('/api/throttle/config').then(r=>r.json()).then(tc=>{"
+"if(tc.enabled!==undefined){"
+"document.getElementById('th-en').checked=(tc.enabled>0);"
+"document.getElementById('th-drop').value=tc.max_drop;"
+"document.getElementById('th-slope').value=tc.slope;"
+"document.getElementById('th-rpm').value=tc.rpm_rise;"
+"document.getElementById('th-curr').value=tc.curr_drop;"
+"document.getElementById('th-cd').value=tc.cooldown;"
+"}"
+"}).catch(e=>{});"
 "const evt=new EventSource('/events');"
 "evt.onmessage=e=>{"
 "try{"
@@ -637,6 +689,20 @@ static const char HTTP_HTML_PAGE[] =
 "}"
 "if(d.clients!==undefined)document.getElementById('badge-sse').innerText='SSE: '+d.clients+' Client'+(d.clients===1?'':'s');"
 "if(d.ntp!==undefined){const nb=document.getElementById('badge-ntp');if(d.ntp){nb.className='badge ok';nb.innerText='NTP: Synced';}else{nb.className='badge';nb.innerText='NTP: Syncing...';}}"
+"if(d.throt!==undefined){const tb=document.getElementById('badge-throt');const ts=document.getElementById('throt-status');const td=document.getElementById('throt-diag');const en=document.getElementById('th-en').checked;"
+"if(d.throt===1){tb.className='badge err';tb.innerText='THROTTLED -'+(d.throt_drop||0)+'%';if(ts)ts.innerText='Dry-Run Active: reducing PWM by '+(d.throt_drop||0)+'%';}"
+"else if(d.throt===2){tb.className='badge err';tb.innerText='RECOVERING -'+(d.throt_drop||0)+'%';if(ts)ts.innerText='Recovering PWM (-'+(d.throt_drop||0)+'%)';}"
+"else if(en){tb.className='badge ok';tb.innerText='Dry-Run: Armed';if(ts)ts.innerText='Armed (Normal)';}"
+"else{tb.className='badge';tb.innerText='Dry-Run: Off';if(ts)ts.innerText='Throttle: Disabled';}"
+"if(td){if(!en){td.innerText='';}else if(d.throt_brpm>0){"
+"const rr=parseInt(document.getElementById('th-rpm').value)||15;"
+"const cd=parseInt(document.getElementById('th-curr').value)||20;"
+"const tgtRpm=Math.round(d.throt_brpm*(1+rr/100));"
+"const tgtMa=Math.round(d.throt_bma*(1-cd/100));"
+"const devRpm=((d.rpm-d.throt_brpm)/d.throt_brpm*100).toFixed(1);"
+"const devMa=(d.throt_bma>0)?((d.curr-d.throt_bma)/d.throt_bma*100).toFixed(1):'0.0';"
+"td.innerHTML='<b>Armed Target:</b> RPM &ge; '+tgtRpm+' (+'+rr+'% from '+d.throt_brpm+') &bull; Curr &le; '+tgtMa+' mA (-'+cd+'% from '+d.throt_bma+' mA)<br><b>Current Deviation:</b> RPM '+(devRpm>=0?'+':'')+devRpm+'% ('+d.rpm+' vs '+d.throt_brpm+') &bull; Curr '+(devMa>=0?'+':'')+devMa+'% ('+d.curr+' vs '+d.throt_bma+' mA)';"
+"}else{td.innerText='Settling baseline (need 2s steady PWM > 0% with RPM > 50 & Curr > 10 mA)...';}}}"
 "render();"
 "}catch(err){}"
 "};"
@@ -1918,6 +1984,56 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						send_all(client_fd, body, blen);
 						close(client_fd);
 					}
+					/* Match POST /api/throttle/config or GET /api/throttle/config */
+					else if (strncmp(rx_buf, "POST /api/throttle/config", 25) == 0 ||
+					         strncmp(rx_buf, "GET /api/throttle/config", 24) == 0) {
+						if (strstr(rx_buf, "enabled=") || strstr(rx_buf, "max_drop=")) {
+							int en = get_query_param_int(rx_buf, "enabled", g_throttle_cfg.enabled);
+							int md = get_query_param_int(rx_buf, "max_drop", g_throttle_cfg.max_drop_pct);
+							int sl = get_query_param_int(rx_buf, "slope", g_throttle_cfg.slope_pct_per_sec);
+							int rr = get_query_param_int(rx_buf, "rpm_rise", g_throttle_cfg.rpm_rise_pct);
+							int cd = get_query_param_int(rx_buf, "curr_drop", g_throttle_cfg.curr_drop_pct);
+							int co = get_query_param_int(rx_buf, "cooldown", g_throttle_cfg.cooldown_sec);
+
+							if (md < 0) md = 0; else if (md > 100) md = 100;
+							if (sl < 1) sl = 1; else if (sl > 100) sl = 100;
+							if (rr < 1) rr = 1; else if (rr > 200) rr = 200;
+							if (cd < 1) cd = 1; else if (cd > 100) cd = 100;
+							if (co < 1) co = 1; else if (co > 120) co = 120;
+
+							g_throttle_cfg.enabled = en ? 1 : 0;
+							g_throttle_cfg.max_drop_pct = (uint8_t)md;
+							g_throttle_cfg.slope_pct_per_sec = (uint8_t)sl;
+							g_throttle_cfg.rpm_rise_pct = (uint8_t)rr;
+							g_throttle_cfg.curr_drop_pct = (uint8_t)cd;
+							g_throttle_cfg.cooldown_sec = (uint8_t)co;
+
+							int ipm_ret = -ENODEV;
+							if (ipm_dev && device_is_ready(ipm_dev)) {
+								ipm_ret = ipm_send(ipm_dev, 1, IPM_CHANNEL_THROTTLE_CTRL, &g_throttle_cfg, sizeof(g_throttle_cfg));
+							}
+							printk("[PRO_CPU] HTTP /api/throttle/config: en=%u drop=%u%% slope=%u%%/s rpm+%u%% curr-%u%% cd=%us ipm_ret=%d\n",
+							       g_throttle_cfg.enabled, g_throttle_cfg.max_drop_pct, g_throttle_cfg.slope_pct_per_sec,
+							       g_throttle_cfg.rpm_rise_pct, g_throttle_cfg.curr_drop_pct, g_throttle_cfg.cooldown_sec, ipm_ret);
+						}
+
+						char body[160];
+						int blen = snprintf(body, sizeof(body),
+						                    "{\"enabled\":%u,\"max_drop\":%u,\"slope\":%u,\"rpm_rise\":%u,\"curr_drop\":%u,\"cooldown\":%u}\r\n",
+						                    g_throttle_cfg.enabled, g_throttle_cfg.max_drop_pct,
+						                    g_throttle_cfg.slope_pct_per_sec, g_throttle_cfg.rpm_rise_pct,
+						                    g_throttle_cfg.curr_drop_pct, g_throttle_cfg.cooldown_sec);
+						char header[160];
+						int hlen = snprintf(header, sizeof(header),
+						                    "HTTP/1.1 200 OK\r\n"
+						                    "Content-Type: application/json\r\n"
+						                    "Access-Control-Allow-Origin: *\r\n"
+						                    "Content-Length: %d\r\n"
+						                    "Connection: close\r\n\r\n", blen);
+						send_all(client_fd, header, hlen);
+						send_all(client_fd, body, blen);
+						close(client_fd);
+					}
 					/* Match POST /api/reboot or POST /api/reset or GET /api/reboot */
 					else if (strncmp(rx_buf, "POST /api/reboot", 16) == 0 ||
 					         strncmp(rx_buf, "POST /api/reset", 15) == 0 ||
@@ -2006,15 +2122,19 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 				uint32_t volt_int  = cur.bus_mv / 1000;
 				uint32_t volt_frac = (cur.bus_mv % 1000) / 10;
 
-				char sse_data[320];
+				char sse_data[400];
 				int sse_len = snprintf(sse_data, sizeof(sse_data),
-				                       "data: {\"id\":%u,\"rpm\":%u,\"pwm\":%u,\"stage\":%u,\"prof_sec\":%u,\"prof_tot\":%u,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s}\n\n",
+				                       "data: {\"id\":%u,\"rpm\":%u,\"pwm\":%u,\"stage\":%u,\"prof_sec\":%u,\"prof_tot\":%u,\"throt\":%u,\"throt_drop\":%u,\"throt_brpm\":%u,\"throt_bma\":%d,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s}\n\n",
 				                       cur.sample_id,
 				                       cur.motor_rpm,
 				                       cur.pwm_pct,
 				                       cur.profile_stage,
 				                       cur.profile_elapsed_sec,
 				                       cur.profile_total_sec,
+				                       cur.throttle_active,
+				                       cur.throttle_drop_pct,
+				                       cur.throttle_base_rpm,
+				                       cur.throttle_base_ma,
 				                       temp_int, temp_frac,
 				                       volt_int, volt_frac,
 				                       cur.current_ma,
@@ -2100,7 +2220,15 @@ static void ipc_console_thread_fn(void *p1, void *p2, void *p3)
 
 	while (1) {
 		if (k_msgq_get(&ipc_print_msgq, &pkt, K_FOREVER) == 0) {
+			size_t mlen = strlen(pkt.msg);
 			raw_console_printk(pkt.msg);
+			if (mlen > 0 && pkt.msg[mlen - 1] != '\n') {
+				raw_console_printk("\n");
+			}
+			/* Small pacing delay so USB-JTAG-Serial 64B TX FIFO doesn't drop trailing '\n' on back-to-back lines */
+			if (k_msgq_num_used_get(&ipc_print_msgq) > 0) {
+				k_msleep(2);
+			}
 		}
 	}
 }

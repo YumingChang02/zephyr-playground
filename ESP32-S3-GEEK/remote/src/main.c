@@ -142,6 +142,21 @@ static volatile uint32_t g_prof_ctrl_rx_count = 0;
 static volatile uint8_t  g_last_ctrl_action = 0xFF;
 static volatile uint8_t  g_last_ctrl_manual_pwm = 0;
 
+/* Dry-Run / Air-Draw PWM Throttle Configuration & State */
+static volatile ipm_throttle_ctrl_t g_throttle_cfg = {
+	.enabled = DEFAULT_THROTTLE_ENABLED,
+	.max_drop_pct = DEFAULT_THROTTLE_MAX_DROP_PCT,
+	.slope_pct_per_sec = DEFAULT_THROTTLE_SLOPE_PCT_S,
+	.rpm_rise_pct = DEFAULT_THROTTLE_RPM_RISE_PCT,
+	.curr_drop_pct = DEFAULT_THROTTLE_CURR_DROP_PCT,
+	.cooldown_sec = DEFAULT_THROTTLE_COOLDOWN_SEC,
+};
+static volatile bool    g_throttle_log_pending = false;
+static volatile uint8_t g_throttle_state = THROTTLE_STATE_NORMAL;
+static volatile uint8_t g_throttle_drop_pct = 0;
+static volatile uint16_t g_throttle_base_rpm = 0;
+static volatile int16_t  g_throttle_base_ma = 0;
+
 static void app_ipm_callback(const struct device *dev, void *user_data,
                              uint32_t id, volatile void *data)
 {
@@ -204,6 +219,15 @@ static void app_ipm_callback(const struct device *dev, void *user_data,
 		} else {
 			g_prof_log_pending = true;
 		}
+	} else if (id == IPM_CHANNEL_THROTTLE_CTRL && data != NULL) {
+		const ipm_throttle_ctrl_t *tc = (const ipm_throttle_ctrl_t *)data;
+		g_throttle_cfg.enabled = tc->enabled ? 1 : 0;
+		g_throttle_cfg.max_drop_pct = (tc->max_drop_pct > 100) ? 100 : tc->max_drop_pct;
+		g_throttle_cfg.slope_pct_per_sec = (tc->slope_pct_per_sec == 0) ? 1 : ((tc->slope_pct_per_sec > 100) ? 100 : tc->slope_pct_per_sec);
+		g_throttle_cfg.rpm_rise_pct = (tc->rpm_rise_pct == 0) ? 1 : ((tc->rpm_rise_pct > 200) ? 200 : tc->rpm_rise_pct);
+		g_throttle_cfg.curr_drop_pct = (tc->curr_drop_pct == 0) ? 1 : ((tc->curr_drop_pct > 100) ? 100 : tc->curr_drop_pct);
+		g_throttle_cfg.cooldown_sec = (tc->cooldown_sec == 0) ? 1 : ((tc->cooldown_sec > 120) ? 120 : tc->cooldown_sec);
+		g_throttle_log_pending = true;
 	}
 }
 
@@ -304,7 +328,22 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 		uint32_t time_sec_of_day = g_time_sec_of_day;
 		uint16_t time_ms_part = g_time_ms_part;
 		int64_t time_sync_uptime_ms = g_time_sync_uptime_ms;
+		bool throt_log_pending = g_throttle_log_pending;
+		g_throttle_log_pending = false;
+		ipm_throttle_ctrl_t throt_cfg;
+		throt_cfg.enabled = g_throttle_cfg.enabled;
+		throt_cfg.max_drop_pct = g_throttle_cfg.max_drop_pct;
+		throt_cfg.slope_pct_per_sec = g_throttle_cfg.slope_pct_per_sec;
+		throt_cfg.rpm_rise_pct = g_throttle_cfg.rpm_rise_pct;
+		throt_cfg.curr_drop_pct = g_throttle_cfg.curr_drop_pct;
+		throt_cfg.cooldown_sec = g_throttle_cfg.cooldown_sec;
 		irq_unlock(irq_key);
+
+		if (throt_log_pending) {
+			printk("[APP_CPU] Throttle Cfg: en=%u max_drop=%u%% slope=%u%%/s rpm_rise=%u%% curr_drop=%u%% cooldown=%us\n",
+			       throt_cfg.enabled, throt_cfg.max_drop_pct, throt_cfg.slope_pct_per_sec,
+			       throt_cfg.rpm_rise_pct, throt_cfg.curr_drop_pct, throt_cfg.cooldown_sec);
+		}
 
 		if (log_pending) {
 			const char *act_str = "UNKNOWN";
@@ -401,36 +440,6 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 			target_duty = 100;
 		}
 
-		static uint32_t s_applied_pwm_pct = 0xFFFFFFFF;
-		if (target_duty != s_applied_pwm_pct) {
-			g_active_pwm_pct = target_duty;
-			g_disp_pwm_pct = target_duty;
-			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
-				uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
-				int ret = pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
-				uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
-				uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
-				uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
-				if (ret == 0) {
-					s_applied_pwm_pct = target_duty;
-				}
-				printk("[APP_CPU] PWM HW Apply: target=%u%% (pulse=%u ns) -> ret=%d [LEDC reg: duty=%u, sig_en=%u, idle_lv=%u]\n",
-				       target_duty, pulse_ns, ret, hw_duty, sig_en, idle_lv);
-			} else {
-				printk("[APP_CPU] PWM ERROR: pwm_motor device NOT ready!\n");
-			}
-		}
-		duty_cycle_pct = g_active_pwm_pct;
-
-		if ((sample_loop_cnt % (CONFIG_APP_SAMPLE_RATE_HZ * 2)) == 0) {
-			uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
-			uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
-			uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
-			printk("[APP_CPU] PWM Debug: loop=%u stage=%u (%u/%us) target=%u%% applied=%u%% rx=%u [LEDC duty=%u sig=%u idle=%u]\n",
-			       sample_loop_cnt, prof_stage, g_prof_elapsed_sec, g_prof_total_sec,
-			       target_duty, s_applied_pwm_pct, ctrl_rx_cnt, hw_duty, sig_en, idle_lv);
-		}
-
 		uint32_t delta_pulses;
 		if (fg_spec.port && device_is_ready(fg_spec.port)) {
 			unsigned int key = irq_lock();
@@ -466,6 +475,171 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 #endif
 		}
 		uint32_t rpm = s_filtered_rpm;
+
+		/* ----------------------------------------------------------------- */
+		/* Dry-Run / Air-Draw PWM Throttling State Machine                   */
+		/* ----------------------------------------------------------------- */
+		static uint8_t  s_throt_state = THROTTLE_STATE_NORMAL;
+		static uint32_t s_drop_milli_pct = 0;
+		static uint32_t s_last_base_pwm = 0xFFFFFFFF;
+		static uint32_t s_steady_ticks = 0;
+		static bool     s_base_valid = false;
+		static uint32_t s_base_rpm = 0;
+		static int32_t  s_base_curr_ma = 0;
+		static uint8_t  s_trig_hits = 0;
+		static int64_t  s_hold_until_ms = 0;
+
+		uint32_t unthrottled_duty = target_duty;
+		int32_t cur_ma = g_disp_current_ma;
+
+		if (!throt_cfg.enabled || unthrottled_duty == 0) {
+			s_throt_state = THROTTLE_STATE_NORMAL;
+			s_drop_milli_pct = 0;
+			s_base_valid = false;
+			s_steady_ticks = 0;
+			s_trig_hits = 0;
+			s_last_base_pwm = unthrottled_duty;
+		} else {
+			uint32_t step_mpct = ((uint32_t)throt_cfg.slope_pct_per_sec * 1000U) / CONFIG_APP_SAMPLE_RATE_HZ;
+			if (step_mpct == 0) {
+				step_mpct = 100;
+			}
+			uint32_t max_drop_mpct = (uint32_t)throt_cfg.max_drop_pct * 1000U;
+
+			if (s_throt_state == THROTTLE_STATE_NORMAL) {
+				s_drop_milli_pct = 0;
+				uint32_t pwm_diff = (unthrottled_duty > s_last_base_pwm)
+					? (unthrottled_duty - s_last_base_pwm)
+					: (s_last_base_pwm - unthrottled_duty);
+				if (s_last_base_pwm == 0xFFFFFFFF || pwm_diff > 2U) {
+					s_last_base_pwm = unthrottled_duty;
+					s_steady_ticks = 0;
+					s_base_valid = false;
+					s_trig_hits = 0;
+				} else {
+					s_steady_ticks++;
+					if (!s_base_valid) {
+						if (s_steady_ticks >= (CONFIG_APP_SAMPLE_RATE_HZ * 2U)) {
+							s_base_rpm = rpm;
+							s_base_curr_ma = cur_ma;
+							s_base_valid = true;
+						}
+					} else if (s_base_rpm > 50U && s_base_curr_ma > 10) {
+						bool rpm_up = (rpm * 100U) >= (s_base_rpm * (100U + throt_cfg.rpm_rise_pct));
+						bool curr_dn = (cur_ma <= 0) ||
+						               ((int64_t)cur_ma * 100LL <= (int64_t)s_base_curr_ma * (100LL - throt_cfg.curr_drop_pct));
+						if (rpm_up && curr_dn) {
+							s_trig_hits++;
+							if (s_trig_hits >= 3U) {
+								s_throt_state = THROTTLE_STATE_ACTIVE;
+								s_hold_until_ms = now_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
+								s_trig_hits = 0;
+								printk("[APP_CPU] DRY-RUN DETECTED! PWM=%u%% RPM=%u(base=%u) Curr=%dmA(base=%dmA) -> drop up to -%u%% @ %u%%/s\n",
+								       unthrottled_duty, rpm, s_base_rpm, cur_ma, s_base_curr_ma,
+								       throt_cfg.max_drop_pct, throt_cfg.slope_pct_per_sec);
+							}
+						} else {
+							s_trig_hits = 0;
+							/* Freeze baseline if leaning toward dry-run (RPM rising AND mA falling) so gradual transitions still trigger */
+							bool leaning_dry = (rpm > s_base_rpm) && (cur_ma < s_base_curr_ma);
+							if (!leaning_dry) {
+								/* Very slow EMA baseline tracking (~25s time constant) */
+								s_base_rpm = (s_base_rpm * 255U + rpm) / 256U;
+								s_base_curr_ma = (s_base_curr_ma * 255 + cur_ma) / 256;
+							}
+						}
+					} else {
+						/* Re-seed if baseline was near zero */
+						s_base_rpm = rpm;
+						s_base_curr_ma = cur_ma;
+					}
+				}
+			} else if (s_throt_state == THROTTLE_STATE_ACTIVE) {
+				if (s_drop_milli_pct < max_drop_mpct) {
+					s_drop_milli_pct += step_mpct;
+					if (s_drop_milli_pct > max_drop_mpct) {
+						s_drop_milli_pct = max_drop_mpct;
+					}
+				} else if (s_drop_milli_pct > max_drop_mpct) {
+					s_drop_milli_pct = max_drop_mpct;
+				}
+				if (now_ms >= s_hold_until_ms) {
+					int64_t recov_thresh = ((int64_t)s_base_curr_ma * (100LL - (throt_cfg.curr_drop_pct / 2))) / 100LL;
+					if (cur_ma > recov_thresh) {
+						s_throt_state = THROTTLE_STATE_RECOVERING;
+						s_trig_hits = 0;
+						printk("[APP_CPU] Dry-run cooldown done, curr=%dmA > %lldmA -> recovering PWM\n",
+						       cur_ma, (long long)recov_thresh);
+					} else {
+						s_hold_until_ms = now_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
+						printk("[APP_CPU] Dry-run still active (curr=%dmA <= %lldmA) -> holding throttle\n",
+						       cur_ma, (long long)recov_thresh);
+					}
+				}
+			} else { /* THROTTLE_STATE_RECOVERING */
+				bool rpm_up = (s_base_rpm > 50U) && ((rpm * 100U) >= (s_base_rpm * (100U + throt_cfg.rpm_rise_pct)));
+				bool curr_dn = (s_base_curr_ma > 10) &&
+				               ((cur_ma <= 0) || ((int64_t)cur_ma * 100LL <= (int64_t)s_base_curr_ma * (100LL - throt_cfg.curr_drop_pct)));
+				if (rpm_up && curr_dn) {
+					s_trig_hits++;
+					if (s_trig_hits >= 3U) {
+						s_throt_state = THROTTLE_STATE_ACTIVE;
+						s_hold_until_ms = now_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
+						s_trig_hits = 0;
+						printk("[APP_CPU] Dry-run re-triggered during recovery (curr=%dmA, rpm=%u)\n", cur_ma, rpm);
+					}
+				} else {
+					s_trig_hits = 0;
+					if (s_drop_milli_pct > step_mpct) {
+						s_drop_milli_pct -= step_mpct;
+					} else {
+						s_drop_milli_pct = 0;
+						s_throt_state = THROTTLE_STATE_NORMAL;
+						s_base_valid = false;
+						s_steady_ticks = 0;
+						printk("[APP_CPU] Dry-run throttle fully recovered\n");
+					}
+				}
+			}
+		}
+
+		uint32_t drop_pct = s_drop_milli_pct / 1000U;
+		target_duty = (unthrottled_duty > drop_pct) ? (unthrottled_duty - drop_pct) : 0U;
+		g_throttle_state = s_throt_state;
+		g_throttle_drop_pct = (uint8_t)drop_pct;
+		g_throttle_base_rpm = (throt_cfg.enabled && s_base_valid) ? (uint16_t)s_base_rpm : 0U;
+		g_throttle_base_ma = (throt_cfg.enabled && s_base_valid) ? (int16_t)s_base_curr_ma : 0;
+
+		static uint32_t s_applied_pwm_pct = 0xFFFFFFFF;
+		if (target_duty != s_applied_pwm_pct) {
+			g_active_pwm_pct = target_duty;
+			g_disp_pwm_pct = target_duty;
+			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
+				uint32_t pulse_ns = (pwm_motor.period * target_duty) / 100;
+				int ret = pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
+				uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
+				uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+				uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+				if (ret == 0) {
+					s_applied_pwm_pct = target_duty;
+				}
+				printk("[APP_CPU] PWM HW Apply: target=%u%% (pulse=%u ns) -> ret=%d [LEDC reg: duty=%u, sig_en=%u, idle_lv=%u]\n",
+				       target_duty, pulse_ns, ret, hw_duty, sig_en, idle_lv);
+			} else {
+				printk("[APP_CPU] PWM ERROR: pwm_motor device NOT ready!\n");
+			}
+		}
+		duty_cycle_pct = g_active_pwm_pct;
+
+		if ((sample_loop_cnt % (CONFIG_APP_SAMPLE_RATE_HZ * 2)) == 0) {
+			uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_read >> 4;
+			uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+			uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+			printk("[APP_CPU] PWM Debug: loop=%u stage=%u (%u/%us) target=%u%% applied=%u%% throt=%u(-%u%%) base=%uRPM/%dmA rx=%u [LEDC duty=%u sig=%u idle=%u]\n",
+			       sample_loop_cnt, prof_stage, g_prof_elapsed_sec, g_prof_total_sec,
+			       target_duty, s_applied_pwm_pct, s_throt_state, drop_pct,
+			       g_throttle_base_rpm, g_throttle_base_ma, ctrl_rx_cnt, hw_duty, sig_en, idle_lv);
+		}
 
 		if ((sample_loop_cnt % 6) == 0 && fg_spec.port && device_is_ready(fg_spec.port)) {
 			int current_level = gpio_pin_get_dt(&fg_spec);
@@ -556,6 +730,10 @@ static void sensor_aggregator_thread_fn(void *arg1, void *arg2, void *arg3)
 			.profile_stage = (uint8_t)g_prof_stage,
 			.profile_elapsed_sec = (uint16_t)g_prof_elapsed_sec,
 			.profile_total_sec = (uint16_t)g_prof_total_sec,
+			.throttle_active = g_throttle_state,
+			.throttle_drop_pct = g_throttle_drop_pct,
+			.throttle_base_rpm = g_throttle_base_rpm,
+			.throttle_base_ma = g_throttle_base_ma,
 		};
 
 		if (ipm_dev) {

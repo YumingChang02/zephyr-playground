@@ -33,6 +33,10 @@ typedef struct __attribute__((packed)) {
 	uint8_t  profile_stage;        /* PROFILE_STAGE_*                     */
 	uint16_t profile_elapsed_sec;  /* which second point is currently at  */
 	uint16_t profile_total_sec;    /* total duration of 4 stages in sec   */
+	uint8_t  throttle_active;      /* 0=normal, 1=throttling, 2=recovering */
+	uint8_t  throttle_drop_pct;    /* active PWM reduction 0..100%        */
+	uint16_t throttle_base_rpm;    /* armed baseline RPM (0=unarmed)      */
+	int16_t  throttle_base_ma;     /* armed baseline mA                   */
 } telemetry_packet_t;
 
 typedef struct {
@@ -46,6 +50,10 @@ typedef struct {
 	uint8_t  profile_stage;
 	uint16_t profile_elapsed_sec;
 	uint16_t profile_total_sec;
+	uint8_t  throttle_active;
+	uint8_t  throttle_drop_pct;
+	uint16_t throttle_base_rpm;
+	int16_t  throttle_base_ma;
 	char     iso_time[32];
 	char     date_str[16];
 } telemetry_full_t;
@@ -76,5 +84,25 @@ typedef struct __attribute__((packed)) {
 } pwm_profile_ctrl_t;
 
 typedef pwm_profile_ctrl_t ipm_pwm_ctrl_t;
+
+#define DEFAULT_THROTTLE_ENABLED        0
+#define DEFAULT_THROTTLE_MAX_DROP_PCT   30
+#define DEFAULT_THROTTLE_SLOPE_PCT_S    5
+#define DEFAULT_THROTTLE_RPM_RISE_PCT   15
+#define DEFAULT_THROTTLE_CURR_DROP_PCT  20
+#define DEFAULT_THROTTLE_COOLDOWN_SEC   8
+
+#define THROTTLE_STATE_NORMAL           0
+#define THROTTLE_STATE_ACTIVE           1
+#define THROTTLE_STATE_RECOVERING       2
+
+typedef struct __attribute__((packed)) {
+	uint8_t  enabled;
+	uint8_t  max_drop_pct;
+	uint8_t  slope_pct_per_sec;
+	uint8_t  rpm_rise_pct;
+	uint8_t  curr_drop_pct;
+	uint8_t  cooldown_sec;
+} pwm_throttle_ctrl_t;
 
 #endif /* TELEMETRY_H_ */
