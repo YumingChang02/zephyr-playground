@@ -458,7 +458,7 @@ static const char HTTP_HTML_PAGE[] =
 "<div class=\"box\">"
 "<div class=\"box-title\">Dry-Run / Air-Draw PWM Throttling (Auto-Reduce PWM on RPM Rise + mA Drop)</div>"
 "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px;align-items:end\">"
-"<div><label style=\"display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;padding:4px 0\"><input id=\"th-en\" type=\"checkbox\"> Enable Auto-Throttle</label></div>"
+"<div><label style=\"display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;padding:4px 0\"><input id=\"th-en\" type=\"checkbox\" checked> Enable Auto-Throttle</label></div>"
 "<div><div class=\"label\">Max PWM Drop X (%)</div><input id=\"th-drop\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_MAX_DROP_PCT) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
 "<div><div class=\"label\">Slope Y (%/s)</div><input id=\"th-slope\" type=\"number\" min=\"1\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_SLOPE_PCT_S) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"
 "<div><div class=\"label\">RPM Rise Trigger (%)</div><input id=\"th-rpm\" type=\"number\" min=\"1\" max=\"200\" value=\"" STRINGIFY(DEFAULT_THROTTLE_RPM_RISE_PCT) "\" style=\"width:100%;background:#2a2a2a;border:1px solid #444;color:#fff;padding:4px 6px;border-radius:4px;box-sizing:border-box\"></div>"

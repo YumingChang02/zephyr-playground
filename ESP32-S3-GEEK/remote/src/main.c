@@ -505,6 +505,10 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 				step_mpct = 100;
 			}
 			uint32_t max_drop_mpct = (uint32_t)throt_cfg.max_drop_pct * 1000U;
+			uint32_t pwm_cap_mpct = unthrottled_duty * 1000U;
+			if (max_drop_mpct > pwm_cap_mpct) {
+				max_drop_mpct = pwm_cap_mpct;
+			}
 
 			if (s_throt_state == THROTTLE_STATE_NORMAL) {
 				s_drop_milli_pct = 0;

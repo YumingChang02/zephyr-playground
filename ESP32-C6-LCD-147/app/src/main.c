@@ -500,6 +500,10 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 			uint32_t step_mpct = ((uint32_t)throt_cfg.slope_pct_per_sec * 1000U) / CONFIG_APP_SAMPLE_RATE_HZ;
 			if (step_mpct == 0) step_mpct = 100;
 			uint32_t max_drop_mpct = (uint32_t)throt_cfg.max_drop_pct * 1000U;
+			uint32_t pwm_cap_mpct = unthrottled_pwm * 1000U;
+			if (max_drop_mpct > pwm_cap_mpct) {
+				max_drop_mpct = pwm_cap_mpct;
+			}
 
 			if (s_throt_state == THROTTLE_STATE_NORMAL) {
 				s_drop_milli_pct = 0;
@@ -1352,7 +1356,7 @@ static const char INDEX_HTML[] =
 "<div class=\"box\">"
 "<div class=\"box-title\">Dry-Run / Air-Draw PWM Throttling (Auto-Reduce PWM on RPM Rise + mA Drop)</div>"
 "<div style=\"display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:10px;align-items:end\">"
-"<div><label style=\"display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;padding:4px 0\"><input id=\"th-en\" type=\"checkbox\"> Enable Auto-Throttle</label></div>"
+"<div><label style=\"display:flex;align-items:center;gap:6px;font-size:0.8rem;cursor:pointer;padding:4px 0\"><input id=\"th-en\" type=\"checkbox\" checked> Enable Auto-Throttle</label></div>"
 "<div><div class=\"label\">Max PWM Drop X (%)</div><input id=\"th-drop\" type=\"number\" min=\"0\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_MAX_DROP_PCT) "\"></div>"
 "<div><div class=\"label\">Slope Y (%/s)</div><input id=\"th-slope\" type=\"number\" min=\"1\" max=\"100\" value=\"" STRINGIFY(DEFAULT_THROTTLE_SLOPE_PCT_S) "\"></div>"
 "<div><div class=\"label\">RPM Rise Trigger (%)</div><input id=\"th-rpm\" type=\"number\" min=\"1\" max=\"200\" value=\"" STRINGIFY(DEFAULT_THROTTLE_RPM_RISE_PCT) "\"></div>"

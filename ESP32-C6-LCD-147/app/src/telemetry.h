@@ -85,11 +85,11 @@ typedef struct __attribute__((packed)) {
 
 typedef pwm_profile_ctrl_t ipm_pwm_ctrl_t;
 
-#define DEFAULT_THROTTLE_ENABLED        0
-#define DEFAULT_THROTTLE_MAX_DROP_PCT   30
+#define DEFAULT_THROTTLE_ENABLED        1
+#define DEFAULT_THROTTLE_MAX_DROP_PCT   60
 #define DEFAULT_THROTTLE_SLOPE_PCT_S    5
-#define DEFAULT_THROTTLE_RPM_RISE_PCT   15
-#define DEFAULT_THROTTLE_CURR_DROP_PCT  20
+#define DEFAULT_THROTTLE_RPM_RISE_PCT   10
+#define DEFAULT_THROTTLE_CURR_DROP_PCT  15
 #define DEFAULT_THROTTLE_COOLDOWN_SEC   8
 
 #define THROTTLE_STATE_NORMAL           0

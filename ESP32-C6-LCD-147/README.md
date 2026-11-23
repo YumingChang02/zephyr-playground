@@ -30,6 +30,72 @@ The **Waveshare ESP32-C6-LCD-1.47** integrates a 1.47" ST7789 display (172x320) 
 | **I2C SCL** | `GPIO 20` | I2C0 Clock for INA219 Current / Power Sensor |
 | **I2C SDA** | `GPIO 23` | I2C0 Data for INA219 Current / Power Sensor |
 
+### Breadboard Physical Pinout & Wiring Diagram
+
+Top view of the **Waveshare ESP32-C6-LCD-1.47** seated across a standard breadboard center channel (USB-C at bottom), showing the on-board reserved pins and the external connections used by this project:
+
+```text
+  Breadboard (-) GND Rail ───────┬───────────────────────────────────────────────┬──── 12V PSU (-)
+  Breadboard (+) 3V3 Rail ───────┼───────┬───────────────────────────────────────┼──┐
+                                 │       │                                       │  │
+                        ┌────────┴───────┴────────┐                              │  │
+                        │    ESP32-C6-LCD-1.47    │                              │  │
+  5V (USB VBUS) ───────o│ 5V                  GND │o── (Common GND)              │  │
+  Common GND    ───────o│ GND                 3V3 │o─────────────────────────────┼──┘
+  (Onboard RGB) ───────o│ IO8 (WS2812)       IO16 │o── UART0 TX                  │
+  (Boot Button) ───────o│ IO9 (BOOT)         IO17 │o── UART0 RX                  │
+  (SD Card CS)  ───────o│ IO4 (SD_CS)        IO18 │o──► Motor PWM (25 kHz)       │
+  (SPI MISO)    ───────o│ IO5 (SD_MISO)      IO19 │o◄── Motor FG (10k Pull-Up)   │
+  (SPI MOSI)    ───────o│ IO6 (MOSI)         IO20 │o──► INA219 SCL               │
+  (SPI SCLK)    ───────o│ IO7 (SCLK)         IO21 │o── (Onboard LCD RST)         │
+  (LCD CS)      ───────o│ IO14 (LCD_CS)      IO22 │o── (Onboard LCD BL)          │
+  (LCD DC)      ───────o│ IO15 (LCD_DC)      IO23 │o──► INA219 SDA               │
+                        │         [USB-C]         │                              │
+                        └─────────────────────────┘                              │
+                                                                                 │
+  ┌──────────────────────────────────────────────────────────────────────┐       │
+  │  Breadboard Peripheral Connections                                   │       │
+  │                                                                      │       │
+  │  [INA219 @ 0x40]                 [4-Wire BLDC Pump / Motor]          │       │
+  │   VCC  ◄── 3V3 Rail               VCC (Red)   ◄── INA219 VIN-        │       │
+  │   GND  ◄── GND Rail               PWM (Blue)  ◄── IO18 (GPIO 18)     │       │
+  │   SCL  ◄── IO20 (GPIO 20)         FG  (Yel)   ──► IO19 (+ 10k to 3V3)│       │
+  │   SDA  ◄── IO23 (GPIO 23)         GND (Black) ──► GND Rail ──────────┴───────┘
+  │   VIN+ ◄── 12V PSU (+)
+  │   VIN- ──► Motor VCC (Red)
+  └──────────────────────────────────────────────────────────────────────┘
+```
+  12V Motor PSU (+) ──────────────────────────┐
+                                              ▼
+  +-----------------------------------+   +-------------------+
+  |  Waveshare ESP32-C6-LCD-1.47      |   |  INA219 (0x40)    |
+  |                                   |   |                   |
+  |  [3V3] ───────────────────────────┼──►| VCC          VIN+ |◄── 12V PSU (+)
+  |  [GND] ──────┬────────────────────┼──►| GND          VIN- |──┐
+  |              │                    |   |                   |  │
+  |  [GPIO 20] ──┼────────────────────┼──►| SCL               |  │
+  |  [GPIO 23] ──┼────────────────────┼──►| SDA               |  │
+  |              │                    |   +-------------------+  │
+  |              │                    |                          │
+  |              │                    |   +-------------------+  │
+  |              │                    |   |  4-Wire Pump/Fan  |  │
+  |              │                    |   |                   |  │
+  |              │                    |   | VCC (Red)         |◄─┘
+  |  [GPIO 18] ──┼────────────────────┼──►| PWM (Blue/White)  |
+  |  [GPIO 19] ◄─┼────────────────────┼───┤ FG  (Yellow)      |
+  |              ├────────────────────┼──►| GND (Black)       |
+  +--------------┼--------------------+   +-------------------+
+                 │
+                 ▼
+  12V Motor PSU (-) / Common Breadboard GND Rail
+```
+
+> **Wiring Notes:**
+> - **Verify Silkscreen:** Pin positions on the left/right headers can vary slightly between Waveshare board revisions; always match the **GPIO number printed on the board silkscreen** (`IO18`, `IO19`, `IO20`, `IO23`, `3V3`, `GND`).
+> - **Common Ground:** Tie `GND` of the 12V motor power supply, `GND` of the INA219, `GND` of the motor/pump, and `GND` of the ESP32-C6 together on the breadboard ground rail.
+> - **3.3V Logic Only:** ESP32-C6 GPIOs are **3.3V** (not 5V tolerant). Power the INA219 from `3V3` so `SDA`/`SCL` pull-ups stay at 3.3V, and never pull `FG` (`IO19`) up to 12V.
+> - **Avoid On-board Reserved Pins:** `IO4`, `IO5`, `IO6`, `IO7`, `IO8`, `IO9`, `IO14`, `IO15`, `IO21`, and `IO22` are wired to the on-board ST7789 LCD, MicroSD slot, WS2812 RGB LED, or Boot button.
+
 ---
 
 ## 2. Software Architecture
