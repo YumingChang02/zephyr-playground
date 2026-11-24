@@ -10,6 +10,7 @@
 		motor-pwm = &pwm_motor;
 		fg-pin = &fg_sensor;
 		lcd-bl = &lcd_backlight;
+		lcd-bl-pwm = &pwm_lcd_bl;
 	};
 
 	chosen {
@@ -22,12 +23,16 @@
 			pwms = <&ledc0 0 PWM_USEC(40) PWM_POLARITY_INVERTED>; /* 25 kHz, Active-Low */
 			label = "Motor PWM Output";
 		};
+		pwm_lcd_bl: pwm_lcd_bl_0 {
+			pwms = <&ledc0 1 PWM_USEC(40) PWM_POLARITY_NORMAL>; /* 25 kHz, Active-High */
+			label = "LCD Backlight PWM";
+		};
 	};
 
 	sensor_pins {
 		compatible = "gpio-keys";
 		fg_sensor: fg_sensor_0 {
-			gpios = <&gpio0 19 GPIO_PULL_UP>;
+			gpios = <&gpio0 1 GPIO_PULL_UP>;
 			label = "Motor FG Pulse Input";
 		};
 	};
@@ -83,9 +88,13 @@
 &pinctrl {
 	ledc0_default: ledc0_default {
 		group1 {
-			pinmux = <LEDC_CH0_GPIO18>;
+			pinmux = <LEDC_CH0_GPIO0>;
 			output-enable;
 			bias-pull-up;
+		};
+		group2 {
+			pinmux = <LEDC_CH1_GPIO22>;
+			output-enable;
 		};
 	};
 
@@ -121,6 +130,11 @@
 	channel0@0 {
 		reg = <0x0>;
 		timer = <0>;
+	};
+
+	channel1@1 {
+		reg = <0x1>;
+		timer = <1>;
 	};
 };
 

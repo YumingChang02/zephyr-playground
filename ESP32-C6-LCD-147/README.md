@@ -25,77 +25,45 @@ The **Waveshare ESP32-C6-LCD-1.47** integrates a 1.47" ST7789 display (172x320) 
 ### External Breakout Header Connections
 | Function | GPIO Pin | Description |
 | :--- | :--- | :--- |
-| **Motor PWM** | `GPIO 18` | Hardware LEDC PWM Channel 0 (25 kHz, Active-Low) |
-| **FG Tachometer** | `GPIO 19` | Motor Frequency Generator Tachometer Pulse Input (Falling Edge Interrupt) |
+| **Motor PWM** | `GPIO 0` | Hardware LEDC PWM Channel 0 (25 kHz, Active-Low) |
+| **FG Tachometer** | `GPIO 1` | Motor Frequency Generator Tachometer Pulse Input (Falling Edge Interrupt) |
 | **I2C SCL** | `GPIO 20` | I2C0 Clock for INA219 Current / Power Sensor |
 | **I2C SDA** | `GPIO 23` | I2C0 Data for INA219 Current / Power Sensor |
 
 ### Breadboard Physical Pinout & Wiring Diagram
 
-Top view of the **Waveshare ESP32-C6-LCD-1.47** seated across a standard breadboard center channel (USB-C at bottom), showing the on-board reserved pins and the external connections used by this project:
+Back view of the **Waveshare ESP32-C6-LCD-1.47** (USB-C at top, 9 pins per side) seated across a breadboard:
 
 ```text
-  Breadboard (-) GND Rail ───────┬───────────────────────────────────────────────┬──── 12V PSU (-)
-  Breadboard (+) 3V3 Rail ───────┼───────┬───────────────────────────────────────┼──┐
-                                 │       │                                       │  │
-                        ┌────────┴───────┴────────┐                              │  │
-                        │    ESP32-C6-LCD-1.47    │                              │  │
-  5V (USB VBUS) ───────o│ 5V                  GND │o── (Common GND)              │  │
-  Common GND    ───────o│ GND                 3V3 │o─────────────────────────────┼──┘
-  (Onboard RGB) ───────o│ IO8 (WS2812)       IO16 │o── UART0 TX                  │
-  (Boot Button) ───────o│ IO9 (BOOT)         IO17 │o── UART0 RX                  │
-  (SD Card CS)  ───────o│ IO4 (SD_CS)        IO18 │o──► Motor PWM (25 kHz)       │
-  (SPI MISO)    ───────o│ IO5 (SD_MISO)      IO19 │o◄── Motor FG (10k Pull-Up)   │
-  (SPI MOSI)    ───────o│ IO6 (MOSI)         IO20 │o──► INA219 SCL               │
-  (SPI SCLK)    ───────o│ IO7 (SCLK)         IO21 │o── (Onboard LCD RST)         │
-  (LCD CS)      ───────o│ IO14 (LCD_CS)      IO22 │o── (Onboard LCD BL)          │
-  (LCD DC)      ───────o│ IO15 (LCD_DC)      IO23 │o──► INA219 SDA               │
-                        │         [USB-C]         │                              │
-                        └─────────────────────────┘                              │
-                                                                                 │
-  ┌──────────────────────────────────────────────────────────────────────┐       │
-  │  Breadboard Peripheral Connections                                   │       │
-  │                                                                      │       │
-  │  [INA219 @ 0x40]                 [4-Wire BLDC Pump / Motor]          │       │
-  │   VCC  ◄── 3V3 Rail               VCC (Red)   ◄── INA219 VIN-        │       │
-  │   GND  ◄── GND Rail               PWM (Blue)  ◄── IO18 (GPIO 18)     │       │
-  │   SCL  ◄── IO20 (GPIO 20)         FG  (Yel)   ──► IO19 (+ 10k to 3V3)│       │
-  │   SDA  ◄── IO23 (GPIO 23)         GND (Black) ──► GND Rail ──────────┴───────┘
-  │   VIN+ ◄── 12V PSU (+)
-  │   VIN- ──► Motor VCC (Red)
-  └──────────────────────────────────────────────────────────────────────┘
-```
-  12V Motor PSU (+) ──────────────────────────┐
-                                              ▼
-  +-----------------------------------+   +-------------------+
-  |  Waveshare ESP32-C6-LCD-1.47      |   |  INA219 (0x40)    |
-  |                                   |   |                   |
-  |  [3V3] ───────────────────────────┼──►| VCC          VIN+ |◄── 12V PSU (+)
-  |  [GND] ──────┬────────────────────┼──►| GND          VIN- |──┐
-  |              │                    |   |                   |  │
-  |  [GPIO 20] ──┼────────────────────┼──►| SCL               |  │
-  |  [GPIO 23] ──┼────────────────────┼──►| SDA               |  │
-  |              │                    |   +-------------------+  │
-  |              │                    |                          │
-  |              │                    |   +-------------------+  │
-  |              │                    |   |  4-Wire Pump/Fan  |  │
-  |              │                    |   |                   |  │
-  |              │                    |   | VCC (Red)         |◄─┘
-  |  [GPIO 18] ──┼────────────────────┼──►| PWM (Blue/White)  |
-  |  [GPIO 19] ◄─┼────────────────────┼───┤ FG  (Yellow)      |
-  |              ├────────────────────┼──►| GND (Black)       |
-  +--------------┼--------------------+   +-------------------+
-                 │
-                 ▼
-  12V Motor PSU (-) / Common Breadboard GND Rail
+                        ┌─────────────────────────┐
+                        │        [ USB-C ]        │
+                        │ [BOOT]           [RST]  │
+                        ├─────────────────────────┤
+               5V  ─── o│ 5V                 TXD │o ─── UART0 TX
+   Common GND  ◄──┬─── o│ GND                RXD │o ─── UART0 RX
+  3.3V Rail (+)◄──┼─┬─ o│ 3V3                 13 │o ─── GP13
+   Motor PWM   ◄──┼─┼─ o│ 0 (GP0)             12 │o ─── GP12
+   Motor FG    ───┼─┼► o│ 1 (GP1)             23 │o ──► INA219 SDA
+                  │ │  o│ 2 (GP2)             20 │o ──► INA219 SCL
+                  │ │  o│ 3 (GP3)             19 │o ─── GP19
+   (SD_CS)        │ │  o│ 4 (GP4)             18 │o ─── GP18
+   (SD_MISO)      │ │  o│ 5 (GP5)              9 │o ─── GP9 (Boot Key)
+                  │ │   └─────────────────────────┘
+                  │ │
+                  │ │   ┌─────────────────────────┐   ┌────────────────────────┐
+                  │ └──►│ VCC   INA219 (0x40)     │   │ 4-Wire BLDC Pump/Motor │
+                  ├────►│ GND                VIN+ │◄──┼── 12V PSU (+)          │
+                  │     │ SCL ◄── GP20       VIN- │──►│ VCC (Red)              │
+                  │     │ SDA ◄── GP23            │   │ PWM (Blue)  ◄── GP0    │
+                  │     └─────────────────────────┘   │ FG  (Yel)   ──► GP1    │
+                  └──────────────────────────────────►│ GND (Black) ──► 12V (-)│
+                                                      └────────────────────────┘
 ```
 
 > **Wiring Notes:**
-> - **Verify Silkscreen:** Pin positions on the left/right headers can vary slightly between Waveshare board revisions; always match the **GPIO number printed on the board silkscreen** (`IO18`, `IO19`, `IO20`, `IO23`, `3V3`, `GND`).
-> - **Common Ground:** Tie `GND` of the 12V motor power supply, `GND` of the INA219, `GND` of the motor/pump, and `GND` of the ESP32-C6 together on the breadboard ground rail.
-> - **3.3V Logic Only:** ESP32-C6 GPIOs are **3.3V** (not 5V tolerant). Power the INA219 from `3V3` so `SDA`/`SCL` pull-ups stay at 3.3V, and never pull `FG` (`IO19`) up to 12V.
-> - **Avoid On-board Reserved Pins:** `IO4`, `IO5`, `IO6`, `IO7`, `IO8`, `IO9`, `IO14`, `IO15`, `IO21`, and `IO22` are wired to the on-board ST7789 LCD, MicroSD slot, WS2812 RGB LED, or Boot button.
-
+> - **Common Ground:** Tie `GND` (Left pin 2), INA219 `GND`, Motor `GND`, and 12V PSU `(−)` together on the breadboard ground rail.
+> - **3.3V Logic Only:** ESP32-C6 GPIOs are **3.3V** (not 5V tolerant). Power the INA219 from `3V3` (Left pin 3) and pull `FG` (`GP1`) up to `3V3` (10 kΩ or internal pull-up), never to 12V.
+> - **Avoid On-board Reserved Pins:** `GP4` (`SD_CS`) and `GP5` (`SD_MISO`) are shared with the on-board MicroSD slot.
 ---
 
 ## 2. Software Architecture
@@ -104,7 +72,7 @@ Unlike the dual-core AMP sysbuild on ESP32-S3, the **ESP32-C6 architecture is a 
 
 ```
 [Hardware Interrupts / Peripherals]
-  ├── GPIO 19 Falling-Edge ISR  ──> [Thread 1: Motor Speed & Profile (Priority 2)]
+  ├── GPIO 1 Falling-Edge ISR   ──> [Thread 1: Motor Speed & Profile (Priority 2)]
   │                                       │ (motor_speed_msgq)
   │                                       ▼
   ├── I2C0 INA219 Sensor        ──> [Thread 2: Sensor Aggregator (Priority 4)]
