@@ -62,11 +62,15 @@ typedef struct {
 #define CONFIG_APP_MAX_FG_RPM 5500
 #endif
 
+#ifndef CONFIG_APP_DEFAULT_P_HIGH_PCT
+#define CONFIG_APP_DEFAULT_P_HIGH_PCT 80
+#endif
+
 #define DEFAULT_PROF_T_LOW   410
 #define DEFAULT_PROF_P_LOW   0
 #define DEFAULT_PROF_T_UP    10
 #define DEFAULT_PROF_T_HIGH  170
-#define DEFAULT_PROF_P_HIGH  70
+#define DEFAULT_PROF_P_HIGH  CONFIG_APP_DEFAULT_P_HIGH_PCT
 #define DEFAULT_PROF_T_DROP  10
 #define DEFAULT_PROF_TOTAL   (DEFAULT_PROF_T_LOW + DEFAULT_PROF_T_UP + DEFAULT_PROF_T_HIGH + DEFAULT_PROF_T_DROP)
 
@@ -104,5 +108,49 @@ typedef struct __attribute__((packed)) {
 	uint8_t  curr_drop_pct;
 	uint8_t  cooldown_sec;
 } pwm_throttle_ctrl_t;
+
+#ifndef CONFIG_APP_CAL_WARMUP_MS
+#define CONFIG_APP_CAL_WARMUP_MS 6500
+#endif
+
+#ifndef CONFIG_APP_CAL_SETTLE_MS
+#define CONFIG_APP_CAL_SETTLE_MS 3000
+#endif
+
+#ifndef CONFIG_APP_OP_SETTLE_MS
+#define CONFIG_APP_OP_SETTLE_MS 2000
+#endif
+
+#define AIR_CAL_MIN_PCT     10
+#define AIR_CAL_STEP_PCT    5
+#define AIR_CAL_POINTS      19 /* 10%, 15%, 20%, ..., 100% */
+
+typedef struct {
+	uint8_t  pwm_pct;
+	uint16_t rpm;
+	uint32_t power_mw;
+} air_cal_point_t;
+
+typedef struct {
+	bool            valid;
+	uint32_t        max_rpm_103_ceil;
+	air_cal_point_t pts[AIR_CAL_POINTS];
+} air_cal_data_t;
+
+typedef struct {
+	uint8_t  enabled;          /* 1=closed-loop in HIGH stage, 0=fixed p_high_pct */
+	uint16_t target_max_rpm;   /* target max RPM when drawing water */
+	uint16_t lower_rpm_clip;   /* clip PWM to 0% if RPM <= this in drop/air */
+	uint8_t  start_pwm_pct;    /* initial test PWM at start of HIGH stage */
+	uint8_t  check_up_sec;     /* seconds between speed-up checks */
+	uint8_t  check_down_sec;   /* seconds between speed-down checks */
+	uint8_t  gain_up_pct;      /* PWM% jump scaling for speed-up */
+	uint8_t  gain_down_pct;    /* PWM% jump scaling for speed-down */
+	int16_t  up_thresh_pct;    /* % above baseline power (or below RPM) to increase */
+	int16_t  dn_thresh_pct;    /* % above baseline power to reduce (hold in between) */
+	int8_t   cal_rpm_shift_pct;/* motor degradation RPM shift % */
+	int8_t   cal_pwr_shift_pct;/* motor degradation Power shift % */
+	uint8_t  rpm_drop_pct;     /* RPM must be this % below air baseline to count as water */
+} closed_loop_ctrl_t;
 
 #endif /* TELEMETRY_H_ */

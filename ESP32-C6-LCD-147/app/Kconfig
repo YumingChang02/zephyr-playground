@@ -83,6 +83,37 @@ config APP_MOTOR_KICK_PWM_PCT
 	  Minimum PWM duty cycle percentage applied during spin-up and
 	  stall-recovery kicks until the motor spins.
 
+config APP_DEFAULT_P_HIGH_PCT
+	int "Default High Stage Max PWM (%)"
+	default 80
+	range 0 100
+	help
+	  Default maximum PWM percentage for the high stage (75-85% recommended).
+
+config APP_CAL_WARMUP_MS
+	int "Air Calibration Wait Time Before Recording (ms)"
+	default 6500
+	range 0 30000
+	help
+	  Time in milliseconds to wait at each PWM step during air calibration
+	  before starting to average RPM and power draw.
+
+config APP_CAL_SETTLE_MS
+	int "Air Calibration Settle Time per Step (ms)"
+	default 3500
+	range 500 30000
+	help
+	  Time in milliseconds to wait at each PWM step during air calibration
+	  before recording RPM and power draw.
+
+config APP_OP_SETTLE_MS
+	int "Closed-Loop Operation Settle Time (ms)"
+	default 2000
+	range 200 30000
+	help
+	  Time in milliseconds to wait after a PWM change or stage start before
+	  evaluating closed-loop RPM/power comparisons.
+
 endmenu
 
 source "Kconfig.zephyr"

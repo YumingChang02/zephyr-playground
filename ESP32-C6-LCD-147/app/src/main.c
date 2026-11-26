@@ -206,10 +206,42 @@ static pwm_throttle_ctrl_t g_throttle_cfg = {
 };
 static volatile bool     g_throttle_log_pending = false;
 
+static closed_loop_ctrl_t g_closed_loop_cfg = {
+	.enabled = 1,
+	.target_max_rpm = 4500,
+	.lower_rpm_clip = 1200,
+	.start_pwm_pct = 35,
+	.check_up_sec = 2,
+	.check_down_sec = 2,
+	.gain_up_pct = 2,
+	.gain_down_pct = 2,
+	.up_thresh_pct = 15,
+	.dn_thresh_pct = 5,
+	.cal_rpm_shift_pct = 0,
+	.cal_pwr_shift_pct = 0,
+	.rpm_drop_pct = 5,
+};
+
+static air_cal_data_t g_air_cal = { .valid = false, .max_rpm_103_ceil = CONFIG_APP_MAX_FG_RPM };
+static volatile bool g_air_cal_requested = false;
+static volatile bool g_air_cal_active = false;
+static volatile uint8_t g_air_cal_step_idx = 0;
+
+static void air_cal_compute_max_rpm(void);
+static bool air_cal_save_sd(void);
+static int sd_format_and_remount(void);
+static bool air_cal_lookup(uint32_t pwm_pct, uint32_t *out_rpm, uint32_t *out_pwr_mw);
+
 /* Real-Time Display Shared Values */
 static volatile uint32_t g_disp_pwm_pct = 0;
 static volatile uint32_t g_disp_rpm = 0;
 static volatile int32_t  g_disp_current_ma = 0;
+static volatile uint32_t g_disp_bus_mv = 12000;
+/* Raw closed-loop comparison values (live vs air baseline), streamed via SSE */
+static volatile int      g_cl_ok = 0;
+static volatile uint32_t g_cl_live_pwr_mw = 0, g_cl_base_pwr_mw = 0;
+static volatile uint32_t g_cl_live_rpm = 0, g_cl_base_rpm = 0;
+static volatile int32_t  g_cl_pwr_diff_x10 = 0, g_cl_rpm_diff_x10 = 0;
 
 /* Wi-Fi & SSE State */
 static volatile bool wifi_connected = false;
@@ -442,41 +474,11 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		uint32_t total = t1 + t2 + t3 + t4;
 		g_prof_total_sec = (uint16_t)total;
 
-		if ((cfg.action == PWM_ACTION_START_PROFILE || cfg.action == PWM_ACTION_SET_CONFIG_ONLY) && total > 0) {
-			uint32_t phase_sec = cur_sec_of_day % total;
-			prof_elapsed = (uint16_t)phase_sec;
-
-			if (phase_sec < t1) {
-				stage = PROFILE_STAGE_LOW;
-				target_pwm = pL;
-			} else if (phase_sec < t1 + t2) {
-				stage = PROFILE_STAGE_UP;
-				uint32_t ramp_total_ms = t2 * 1000U;
-				uint32_t dt_ms = (phase_sec - t1) * 1000U + cur_sub_ms;
-				if (dt_ms > ramp_total_ms) {
-					dt_ms = ramp_total_ms;
-				}
-				if (pH >= pL) {
-					target_pwm = pL + (ramp_total_ms > 0 ? ((pH - pL) * dt_ms) / ramp_total_ms : (pH - pL));
-				} else {
-					target_pwm = pL - (ramp_total_ms > 0 ? ((pL - pH) * dt_ms) / ramp_total_ms : (pL - pH));
-				}
-			} else if (phase_sec < t1 + t2 + t3) {
-				stage = PROFILE_STAGE_HIGH;
-				target_pwm = pH;
-			} else {
-				stage = PROFILE_STAGE_DROP;
-				uint32_t drop_total_ms = t4 * 1000U;
-				uint32_t dt_ms = (phase_sec - (t1 + t2 + t3)) * 1000U + cur_sub_ms;
-				if (dt_ms > drop_total_ms) {
-					dt_ms = drop_total_ms;
-				}
-				if (pH >= pL) {
-					target_pwm = pH - (drop_total_ms > 0 ? ((pH - pL) * dt_ms) / drop_total_ms : (pH - pL));
-				} else {
-					target_pwm = pH + (drop_total_ms > 0 ? ((pL - pH) * dt_ms) / drop_total_ms : (pL - pH));
-				}
-			}
+		if ((cfg.action == PWM_ACTION_START_PROFILE || cfg.action == PWM_ACTION_SET_CONFIG_ONLY) &&
+		    (!g_closed_loop_cfg.enabled || g_air_cal.valid)) {
+			stage = PROFILE_STAGE_HIGH;
+			prof_elapsed = (uint16_t)(total > 0 ? (cur_sec_of_day % total) : 0);
+			target_pwm = pH;
 		} else if (cfg.action == PWM_ACTION_MANUAL_PWM) {
 			stage = PROFILE_STAGE_IDLE;
 			prof_elapsed = 0;
@@ -485,6 +487,141 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 			stage = PROFILE_STAGE_IDLE;
 			prof_elapsed = 0;
 			target_pwm = 0;
+		}
+
+		/* Air Calibration Sweep (overrides profile when active) */
+		static int64_t s_cal_step_start_ms = 0;
+		static uint64_t s_cal_rpm_sum = 0;
+		static uint64_t s_cal_pwr_sum = 0;
+		static uint32_t s_cal_samples = 0;
+		if (g_air_cal_requested) {
+			g_air_cal_requested = false;
+			g_air_cal_active = true;
+			g_air_cal_step_idx = 0;
+			g_air_cal.valid = false;
+			memset(g_air_cal.pts, 0, sizeof(g_air_cal.pts));
+			s_cal_step_start_ms = current_time_ms;
+			s_cal_rpm_sum = 0;
+			s_cal_pwr_sum = 0;
+			s_cal_samples = 0;
+			sd_format_and_remount();
+			printk("[Thread 1] Air Calibration Started (10..100%% in %d%% steps, wait=%d ms, avg=%d ms)\n",
+			       AIR_CAL_STEP_PCT, CONFIG_APP_CAL_WARMUP_MS, CONFIG_APP_CAL_SETTLE_MS);
+		}
+		if (g_air_cal_active) {
+			uint32_t cal_pwm = AIR_CAL_MIN_PCT + (uint32_t)g_air_cal_step_idx * AIR_CAL_STEP_PCT;
+			target_pwm = cal_pwm;
+			stage = PROFILE_STAGE_IDLE;
+			int64_t cal_dt = current_time_ms - s_cal_step_start_ms;
+			if (cal_dt >= (int64_t)CONFIG_APP_CAL_WARMUP_MS) {
+				uint32_t pwr_mw = (g_disp_bus_mv * (uint32_t)(g_disp_current_ma > 0 ? g_disp_current_ma : 0)) / 1000U;
+				s_cal_rpm_sum += ema_rpm;
+				s_cal_pwr_sum += pwr_mw;
+				s_cal_samples++;
+			}
+			if (cal_dt >= ((int64_t)CONFIG_APP_CAL_WARMUP_MS + (int64_t)CONFIG_APP_CAL_SETTLE_MS)) {
+				uint32_t avg_rpm = (s_cal_samples > 0U) ? (uint32_t)(s_cal_rpm_sum / s_cal_samples) : ema_rpm;
+				uint32_t avg_pwr = (s_cal_samples > 0U) ? (uint32_t)(s_cal_pwr_sum / s_cal_samples) : 0U;
+				g_air_cal.pts[g_air_cal_step_idx].pwm_pct = (uint8_t)cal_pwm;
+				g_air_cal.pts[g_air_cal_step_idx].rpm = (uint16_t)avg_rpm;
+				g_air_cal.pts[g_air_cal_step_idx].power_mw = avg_pwr;
+				printk("[Thread 1] Air Cal [%u/%d] PWM=%u%% AvgRPM=%u AvgPower=%umW (%u samples)\n",
+				       g_air_cal_step_idx + 1, AIR_CAL_POINTS, cal_pwm, avg_rpm, avg_pwr, s_cal_samples);
+				g_air_cal_step_idx++;
+				s_cal_step_start_ms = current_time_ms;
+				s_cal_rpm_sum = 0;
+				s_cal_pwr_sum = 0;
+				s_cal_samples = 0;
+				if (g_air_cal_step_idx >= AIR_CAL_POINTS) {
+					g_air_cal.valid = true;
+					air_cal_compute_max_rpm();
+					air_cal_save_sd();
+					g_air_cal_active = false;
+					target_pwm = 0;
+				}
+			}
+		}
+
+		/* Closed-Loop Control during PROFILE_STAGE_HIGH */
+		static uint8_t s_cl_prev_stage = PROFILE_STAGE_IDLE;
+		static uint32_t s_cl_pwm = 0;
+		static int64_t s_cl_settle_until_ms = 0;
+		static int64_t s_cl_last_up_ms = 0;
+		static int64_t s_cl_last_dn_ms = 0;
+		static uint16_t s_cl_last_elapsed = 0;
+		if (!g_air_cal_active && stage == PROFILE_STAGE_HIGH && g_closed_loop_cfg.enabled && g_air_cal.valid) {
+			if (s_cl_prev_stage != PROFILE_STAGE_HIGH) {
+				s_cl_pwm = g_closed_loop_cfg.start_pwm_pct;
+				if (s_cl_pwm < pL) s_cl_pwm = pL;
+				if (s_cl_pwm > pH) s_cl_pwm = pH;
+				s_cl_settle_until_ms = current_time_ms + (int64_t)CONFIG_APP_OP_SETTLE_MS;
+				s_cl_last_up_ms = current_time_ms;
+				s_cl_last_dn_ms = current_time_ms;
+				printk("[Thread 1] Closed-Loop HIGH started at %u%% (settle %d ms)\n",
+				       s_cl_pwm, CONFIG_APP_OP_SETTLE_MS);
+			} else if (s_cl_pwm == 0U) {
+				/* Clipped to 0%: stay off until the next stage-progress cycle starts */
+				if (prof_elapsed < s_cl_last_elapsed) {
+					s_cl_pwm = g_closed_loop_cfg.start_pwm_pct;
+					if (s_cl_pwm < pL) s_cl_pwm = pL;
+					if (s_cl_pwm > pH) s_cl_pwm = pH;
+					s_cl_settle_until_ms = current_time_ms + (int64_t)CONFIG_APP_OP_SETTLE_MS;
+					s_cl_last_up_ms = current_time_ms;
+					s_cl_last_dn_ms = current_time_ms;
+					printk("[Thread 1] Closed-Loop new cycle after 0%% clip -> restarting at %u%%\n", s_cl_pwm);
+				}
+			} else if (s_cl_pwm > 0U && current_time_ms >= s_cl_settle_until_ms) {
+				uint32_t base_rpm = 0, base_pwr_mw = 0;
+				if (air_cal_lookup(s_cl_pwm, &base_rpm, &base_pwr_mw) && base_pwr_mw > 0U) {
+					uint32_t live_pwr_mw = (g_disp_bus_mv * (uint32_t)(g_disp_current_ma > 0 ? g_disp_current_ma : 0)) / 1000U;
+					int32_t pwr_diff_pct = ((int32_t)live_pwr_mw - (int32_t)base_pwr_mw) * 100 / (int32_t)base_pwr_mw;
+					int32_t rpm_diff_pct = (base_rpm > 0U) ? (((int32_t)ema_rpm - (int32_t)base_rpm) * 100 / (int32_t)base_rpm) : 0;
+					/* Water = RPM below air baseline AND power above it. Power alone is ambiguous. */
+					bool rpm_dropped = (rpm_diff_pct <= -(int32_t)g_closed_loop_cfg.rpm_drop_pct);
+					if (pwr_diff_pct >= g_closed_loop_cfg.up_thresh_pct && rpm_dropped && ema_rpm < g_closed_loop_cfg.target_max_rpm) {
+						if ((current_time_ms - s_cl_last_up_ms) >= ((int64_t)g_closed_loop_cfg.check_up_sec * 1000LL)) {
+							uint32_t step = g_closed_loop_cfg.gain_up_pct + (uint32_t)((pwr_diff_pct - g_closed_loop_cfg.up_thresh_pct) / 10);
+							if (step < 1U) step = 1U;
+							s_cl_pwm += step;
+							if (s_cl_pwm > pH) s_cl_pwm = pH;
+							s_cl_last_up_ms = current_time_ms;
+							s_cl_settle_until_ms = current_time_ms + (int64_t)CONFIG_APP_OP_SETTLE_MS;
+						}
+					} else if (!rpm_dropped || pwr_diff_pct <= g_closed_loop_cfg.dn_thresh_pct) {
+						if ((current_time_ms - s_cl_last_dn_ms) >= ((int64_t)g_closed_loop_cfg.check_down_sec * 1000LL)) {
+							uint32_t step = g_closed_loop_cfg.gain_down_pct + (uint32_t)((g_closed_loop_cfg.dn_thresh_pct - pwr_diff_pct) / 10);
+							if (step < 1U) step = 1U;
+							s_cl_pwm = (s_cl_pwm > step) ? (s_cl_pwm - step) : 0U;
+							if (ema_rpm <= g_closed_loop_cfg.lower_rpm_clip || s_cl_pwm < 5U) {
+								s_cl_pwm = 0U;
+							}
+							s_cl_last_dn_ms = current_time_ms;
+							s_cl_settle_until_ms = current_time_ms + (int64_t)CONFIG_APP_OP_SETTLE_MS;
+						}
+					}
+				}
+			}
+			target_pwm = s_cl_pwm;
+		}
+		s_cl_prev_stage = stage;
+		s_cl_last_elapsed = prof_elapsed;
+
+		/* Publish the exact live-vs-baseline values the controller compares */
+		{
+			uint32_t d_brpm = 0, d_bpwr = 0;
+			uint32_t d_pwm = target_pwm;
+			if (!g_air_cal_active && d_pwm > 0U && air_cal_lookup(d_pwm, &d_brpm, &d_bpwr) && d_bpwr > 0U && d_brpm > 0U) {
+				uint32_t d_lpwr = (g_disp_bus_mv * (uint32_t)(g_disp_current_ma > 0 ? g_disp_current_ma : 0)) / 1000U;
+				g_cl_live_pwr_mw = d_lpwr;
+				g_cl_base_pwr_mw = d_bpwr;
+				g_cl_live_rpm = ema_rpm;
+				g_cl_base_rpm = d_brpm;
+				g_cl_pwr_diff_x10 = ((int32_t)d_lpwr - (int32_t)d_bpwr) * 1000 / (int32_t)d_bpwr;
+				g_cl_rpm_diff_x10 = ((int32_t)ema_rpm - (int32_t)d_brpm) * 1000 / (int32_t)d_brpm;
+				g_cl_ok = 1;
+			} else {
+				g_cl_ok = 0;
+			}
 		}
 
 		static uint8_t s_prev_stage = 0xFF;
@@ -604,134 +741,11 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 			s_zero_pwm_since_ms = 0;
 		}
 
-		/* ----------------------------------------------------------------- */
-		/* Dry-Run / Air-Draw PWM Throttling State Machine                   */
-		/* ----------------------------------------------------------------- */
-		static uint8_t  s_throt_state = THROTTLE_STATE_NORMAL;
-		static uint32_t s_drop_milli_pct = 0;
-		static uint32_t s_last_base_pwm = 0xFFFFFFFF;
-		static uint32_t s_steady_ticks = 0;
-		static bool     s_base_valid = false;
-		static uint32_t s_base_rpm = 0;
-		static int32_t  s_base_curr_ma = 0;
-		static uint8_t  s_trig_hits = 0;
-		static int64_t  s_hold_until_ms = 0;
-
-		uint32_t unthrottled_pwm = effective_pwm;
-		int32_t cur_ma = g_disp_current_ma;
-
-		if (!throt_cfg.enabled || unthrottled_pwm == 0) {
-			s_throt_state = THROTTLE_STATE_NORMAL;
-			s_drop_milli_pct = 0;
-			s_base_valid = false;
-			s_steady_ticks = 0;
-			s_trig_hits = 0;
-			s_last_base_pwm = unthrottled_pwm;
-		} else {
-			uint32_t step_mpct = ((uint32_t)throt_cfg.slope_pct_per_sec * 1000U) / CONFIG_APP_SAMPLE_RATE_HZ;
-			if (step_mpct == 0) step_mpct = 100;
-			uint32_t max_drop_mpct = (uint32_t)throt_cfg.max_drop_pct * 1000U;
-			uint32_t pwm_cap_mpct = unthrottled_pwm * 1000U;
-			if (max_drop_mpct > pwm_cap_mpct) {
-				max_drop_mpct = pwm_cap_mpct;
-			}
-
-			if (s_throt_state == THROTTLE_STATE_NORMAL) {
-				s_drop_milli_pct = 0;
-				uint32_t pwm_diff = (unthrottled_pwm > s_last_base_pwm)
-					? (unthrottled_pwm - s_last_base_pwm)
-					: (s_last_base_pwm - unthrottled_pwm);
-				if (s_last_base_pwm == 0xFFFFFFFF || pwm_diff > 2U) {
-					s_last_base_pwm = unthrottled_pwm;
-					s_steady_ticks = 0;
-					s_base_valid = false;
-					s_trig_hits = 0;
-				} else {
-					s_steady_ticks++;
-					if (!s_base_valid) {
-						if (s_steady_ticks >= (CONFIG_APP_SAMPLE_RATE_HZ * 2U)) {
-							s_base_rpm = ema_rpm;
-							s_base_curr_ma = cur_ma;
-							s_base_valid = true;
-						}
-					} else if (s_base_rpm > 50U && s_base_curr_ma > 10) {
-						bool rpm_up = (ema_rpm * 100U) >= (s_base_rpm * (100U + throt_cfg.rpm_rise_pct));
-						bool curr_dn = (cur_ma <= 0) ||
-						               ((int64_t)cur_ma * 100LL <= (int64_t)s_base_curr_ma * (100LL - throt_cfg.curr_drop_pct));
-						if (rpm_up && curr_dn) {
-							s_trig_hits++;
-							if (s_trig_hits >= 3U) {
-								s_throt_state = THROTTLE_STATE_ACTIVE;
-								s_hold_until_ms = current_time_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
-								s_trig_hits = 0;
-								printk("[Thread 1] DRY-RUN DETECTED! PWM=%u%% RPM=%u(base=%u) Curr=%dmA(base=%dmA) -> drop up to -%u%% @ %u%%/s\n",
-								       unthrottled_pwm, ema_rpm, s_base_rpm, cur_ma, s_base_curr_ma,
-								       throt_cfg.max_drop_pct, throt_cfg.slope_pct_per_sec);
-							}
-						} else {
-							s_trig_hits = 0;
-							bool leaning_dry = (ema_rpm > s_base_rpm) && (cur_ma < s_base_curr_ma);
-							if (!leaning_dry) {
-								s_base_rpm = (s_base_rpm * 255U + ema_rpm) / 256U;
-								s_base_curr_ma = (s_base_curr_ma * 255 + cur_ma) / 256;
-							}
-						}
-					} else {
-						s_base_rpm = ema_rpm;
-						s_base_curr_ma = cur_ma;
-					}
-				}
-			} else if (s_throt_state == THROTTLE_STATE_ACTIVE) {
-				if (s_drop_milli_pct < max_drop_mpct) {
-					s_drop_milli_pct += step_mpct;
-					if (s_drop_milli_pct > max_drop_mpct) s_drop_milli_pct = max_drop_mpct;
-				} else if (s_drop_milli_pct > max_drop_mpct) {
-					s_drop_milli_pct = max_drop_mpct;
-				}
-				if (current_time_ms >= s_hold_until_ms) {
-					int64_t recov_thresh = ((int64_t)s_base_curr_ma * (100LL - (throt_cfg.curr_drop_pct / 2))) / 100LL;
-					if (cur_ma > recov_thresh) {
-						s_throt_state = THROTTLE_STATE_RECOVERING;
-						s_trig_hits = 0;
-						printk("[Thread 1] Dry-run cooldown done, curr=%dmA > %lldmA -> recovering PWM\n",
-						       cur_ma, (long long)recov_thresh);
-					} else {
-						s_hold_until_ms = current_time_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
-						printk("[Thread 1] Dry-run still active (curr=%dmA <= %lldmA) -> holding throttle\n",
-						       cur_ma, (long long)recov_thresh);
-					}
-				}
-			} else { /* THROTTLE_STATE_RECOVERING */
-				bool rpm_up = (s_base_rpm > 50U) && ((ema_rpm * 100U) >= (s_base_rpm * (100U + throt_cfg.rpm_rise_pct)));
-				bool curr_dn = (s_base_curr_ma > 10) &&
-				               ((cur_ma <= 0) || ((int64_t)cur_ma * 100LL <= (int64_t)s_base_curr_ma * (100LL - throt_cfg.curr_drop_pct)));
-				if (rpm_up && curr_dn) {
-					s_trig_hits++;
-					if (s_trig_hits >= 3U) {
-						s_throt_state = THROTTLE_STATE_ACTIVE;
-						s_hold_until_ms = current_time_ms + (int64_t)throt_cfg.cooldown_sec * 1000LL;
-						s_trig_hits = 0;
-						printk("[Thread 1] Dry-run re-triggered during recovery (curr=%dmA, rpm=%u)\n", cur_ma, ema_rpm);
-					}
-				} else {
-					s_trig_hits = 0;
-					if (s_drop_milli_pct > step_mpct) {
-						s_drop_milli_pct -= step_mpct;
-					} else {
-						s_drop_milli_pct = 0;
-						s_throt_state = THROTTLE_STATE_NORMAL;
-						s_base_valid = false;
-						s_steady_ticks = 0;
-						printk("[Thread 1] Dry-run throttle fully recovered\n");
-					}
-				}
-			}
-		}
-
-		uint32_t drop_pct = s_drop_milli_pct / 1000U;
-		duty_cycle_pct = (unthrottled_pwm > drop_pct) ? (unthrottled_pwm - drop_pct) : 0U;
-		uint16_t base_rpm_snap = (throt_cfg.enabled && s_base_valid) ? (uint16_t)s_base_rpm : 0U;
-		int16_t base_ma_snap = (throt_cfg.enabled && s_base_valid) ? (int16_t)s_base_curr_ma : 0;
+		uint8_t s_throt_state = THROTTLE_STATE_NORMAL;
+		uint32_t drop_pct = 0;
+		duty_cycle_pct = effective_pwm;
+		uint16_t base_rpm_snap = 0U;
+		int16_t base_ma_snap = 0;
 		g_active_pwm_pct = duty_cycle_pct;
 		g_prof_stage = stage;
 		g_prof_elapsed_sec = prof_elapsed;
@@ -853,6 +867,7 @@ static void sensor_aggregator_thread_fn(void *p1, void *p2, void *p3)
 		current_ma = s_filtered_current_ma;
 
 		g_disp_current_ma = current_ma;
+		g_disp_bus_mv = (uint32_t)bus_mv;
 
 		telemetry_full_t full = {
 			.sample_id = speed.sample_id,
@@ -1287,7 +1302,8 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		uint32_t rpm = g_disp_rpm;
 		int32_t cur_ma = g_disp_current_ma;
 
-		uint32_t fg_pct = (rpm * 100) / CONFIG_APP_MAX_FG_RPM;
+		uint32_t max_rpm_scale = g_air_cal.valid ? g_air_cal.max_rpm_103_ceil : CONFIG_APP_MAX_FG_RPM;
+		uint32_t fg_pct = (max_rpm_scale > 0U) ? ((rpm * 100U) / max_rpm_scale) : 0U;
 		uint32_t cur_mag = (uint32_t)(cur_ma < 0 ? -cur_ma : cur_ma);
 		uint32_t curr_pct = (cur_mag * 100) / APP_MAX_CURRENT_MA;
 		if (curr_pct > 100) curr_pct = 100;
@@ -1380,6 +1396,151 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 /* ========================================================================= */
 /* Thread 4: FAT32 SD Card CSV Logger (Priority 7)                           */
 /* ========================================================================= */
+static void air_cal_compute_max_rpm(void)
+{
+	uint32_t max_r = 0;
+	for (int i = 0; i < AIR_CAL_POINTS; i++) {
+		if (g_air_cal.pts[i].rpm > max_r) {
+			max_r = g_air_cal.pts[i].rpm;
+		}
+	}
+	if (max_r > 0) {
+		uint32_t r103 = (max_r * 103U + 99U) / 100U;
+		g_air_cal.max_rpm_103_ceil = ((r103 + 99U) / 100U) * 100U;
+	} else {
+		g_air_cal.max_rpm_103_ceil = CONFIG_APP_MAX_FG_RPM;
+	}
+}
+
+static bool air_cal_save_sd(void)
+{
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	if (!sdcard_mounted) {
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return false;
+	}
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	fs_unlink("/SD:/air_cal.csv");
+	int res = fs_open(&f, "/SD:/air_cal.csv", FS_O_CREATE | FS_O_WRITE);
+	if (res != 0) {
+		printk("[SD] Failed to open /SD:/air_cal.csv for write (%d)\n", res);
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return false;
+	}
+	char line[64];
+	int len = snprintf(line, sizeof(line), "pwm_pct,rpm,power_mw\n");
+	fs_write(&f, line, len);
+	for (int i = 0; i < AIR_CAL_POINTS; i++) {
+		len = snprintf(line, sizeof(line), "%u,%u,%u\n",
+			       g_air_cal.pts[i].pwm_pct, g_air_cal.pts[i].rpm, g_air_cal.pts[i].power_mw);
+		fs_write(&f, line, len);
+	}
+	fs_close(&f);
+	k_mutex_unlock(&sdcard_fs_mutex);
+	printk("[SD] Saved air calibration (%d points, max_103=%u RPM)\n",
+	       AIR_CAL_POINTS, g_air_cal.max_rpm_103_ceil);
+	return true;
+}
+
+static void air_cal_load_sd(void)
+{
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	if (!sdcard_mounted) {
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return;
+	}
+	struct fs_file_t f;
+	fs_file_t_init(&f);
+	if (fs_open(&f, "/SD:/air_cal.csv", FS_O_READ) != 0) {
+		k_mutex_unlock(&sdcard_fs_mutex);
+		return;
+	}
+	char buf[768];
+	ssize_t n = fs_read(&f, buf, sizeof(buf) - 1);
+	fs_close(&f);
+	k_mutex_unlock(&sdcard_fs_mutex);
+	if (n <= 0) {
+		return;
+	}
+	buf[n] = '\0';
+	int idx = 0;
+	char *p = buf;
+	while (*p && idx < AIR_CAL_POINTS) {
+		char *nl = strchr(p, '\n');
+		if (nl) *nl = '\0';
+		if (p[0] >= '0' && p[0] <= '9') {
+			unsigned int pwm = 0, rpm = 0, pwr = 0;
+			if (sscanf(p, "%u,%u,%u", &pwm, &rpm, &pwr) == 3) {
+				g_air_cal.pts[idx].pwm_pct = (uint8_t)pwm;
+				g_air_cal.pts[idx].rpm = (uint16_t)rpm;
+				g_air_cal.pts[idx].power_mw = (uint32_t)pwr;
+				idx++;
+			}
+		}
+		if (!nl) break;
+		p = nl + 1;
+	}
+	if (idx == AIR_CAL_POINTS) {
+		g_air_cal.valid = true;
+		air_cal_compute_max_rpm();
+		printk("[SD] Loaded air calibration from /SD:/air_cal.csv (max_103=%u RPM)\n",
+		       g_air_cal.max_rpm_103_ceil);
+	}
+}
+
+static int sd_format_and_remount(void)
+{
+	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
+	if (g_csv_file_is_open) {
+		fs_close(&g_csv_file);
+		g_csv_file_is_open = false;
+	}
+	if (sdcard_mounted) {
+		fs_unmount(&mp);
+		sdcard_mounted = false;
+	}
+	int res = fs_mkfs(FS_FATFS, (uintptr_t)"SD", NULL, 0);
+	if (res == 0) {
+		mp.fs_data = &fat_fs;
+		res = fs_mount(&mp);
+		if (res == 0) {
+			sdcard_mounted = true;
+			printk("[SD] Formatted full SD card and remounted at %s\n", mp.mnt_point);
+		} else {
+			printk("[SD] Remount after format failed (%d)\n", res);
+		}
+	} else {
+		printk("[SD] fs_mkfs failed (%d)\n", res);
+	}
+	k_mutex_unlock(&sdcard_fs_mutex);
+	return res;
+}
+
+static bool air_cal_lookup(uint32_t pwm_pct, uint32_t *out_rpm, uint32_t *out_pwr_mw)
+{
+	if (!g_air_cal.valid) {
+		return false;
+	}
+	if (pwm_pct < AIR_CAL_MIN_PCT) pwm_pct = AIR_CAL_MIN_PCT;
+	if (pwm_pct > 100U) pwm_pct = 100U;
+	uint32_t idx = (pwm_pct - AIR_CAL_MIN_PCT) / AIR_CAL_STEP_PCT;
+	uint32_t rem = (pwm_pct - AIR_CAL_MIN_PCT) % AIR_CAL_STEP_PCT;
+	uint32_t rpm = g_air_cal.pts[idx].rpm;
+	uint32_t pwr = g_air_cal.pts[idx].power_mw;
+	if (rem > 0U && idx + 1U < AIR_CAL_POINTS) {
+		uint32_t r1 = g_air_cal.pts[idx + 1U].rpm;
+		uint32_t p1 = g_air_cal.pts[idx + 1U].power_mw;
+		rpm = rpm + ((int32_t)(r1 - rpm) * (int32_t)rem) / (int32_t)AIR_CAL_STEP_PCT;
+		pwr = pwr + ((int32_t)(p1 - pwr) * (int32_t)rem) / (int32_t)AIR_CAL_STEP_PCT;
+	}
+	int32_t sr = (int32_t)rpm * (100 + g_closed_loop_cfg.cal_rpm_shift_pct) / 100;
+	int32_t sp = (int32_t)pwr * (100 + g_closed_loop_cfg.cal_pwr_shift_pct) / 100;
+	*out_rpm = (sr > 0) ? (uint32_t)sr : 0U;
+	*out_pwr_mw = (sp > 0) ? (uint32_t)sp : 0U;
+	return true;
+}
+
 static void init_sdcard_fat32(void)
 {
 	k_mutex_lock(&sdcard_fs_mutex, K_FOREVER);
@@ -1396,6 +1557,9 @@ static void init_sdcard_fat32(void)
 		printk("[Thread 4: SD Card] Mount failed (%d)\n", res);
 	}
 	k_mutex_unlock(&sdcard_fs_mutex);
+	if (sdcard_mounted) {
+		air_cal_load_sd();
+	}
 }
 
 static void prune_old_csv_files(void)
@@ -1706,6 +1870,10 @@ static const char INDEX_HTML[] =
 "pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wP;const y=hP-(p.volt/maxV)*hP;if(i===0)xP.moveTo(x,y);else xP.lineTo(x,y);});xP.stroke();"
 "xP.strokeStyle='#ffb74d';xP.lineWidth=2*window.devicePixelRatio;xP.beginPath();"
 "pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wP;const y=hP-((p.curr-minI)/spanI)*hP;if(i===0)xP.moveTo(x,y);else xP.lineTo(x,y);});xP.stroke();"
+"const maxR_p=(typeof calData!=='undefined'&&calData&&calData.max_rpm_103_ceil)?calData.max_rpm_103_ceil:" STRINGIFY(CONFIG_APP_MAX_FG_RPM) ";"
+"xP.strokeStyle='#4fc3f7';xP.lineWidth=2*window.devicePixelRatio;xP.beginPath();"
+"pts.forEach((p,i)=>{const x=(i/(pts.length-1))*wP;const y=hP-(p.rpm/maxR_p)*hP;if(i===0)xP.moveTo(x,y);else xP.lineTo(x,y);});xP.stroke();"
+"xP.fillStyle='#4fc3f7';xP.font=(10*window.devicePixelRatio)+'px sans-serif';xP.fillText(maxR_p+' RPM',wP-65*window.devicePixelRatio,12*window.devicePixelRatio);xP.fillText('0 RPM',wP-45*window.devicePixelRatio,hP-4*window.devicePixelRatio);"
 "if(hoverIdx>=0&&hoverIdx<pts.length){"
 "const xR_c=(hoverIdx/(pts.length-1))*wR;"
 "const xP_c=(hoverIdx/(pts.length-1))*wP;"
@@ -1844,6 +2012,9 @@ static const char INDEX_HTML[] =
 "evt.onmessage=e=>{"
 "try{"
 "const d=JSON.parse(e.data);"
+"window.lastLive={pwm:d.pwm||0,rpm:d.rpm||0,pwr:Math.round((d.volt||0)*Math.max(0,d.curr||0))};"
+"const de=document.getElementById('cl-diff');if(de){if(d.cl_ok){const fp=d.cl_dp/10,fr=d.cl_dr/10;de.innerText='| Live Diff: Power '+(fp>=0?'+':'')+fp.toFixed(1)+'% | RPM '+(fr>=0?'+':'')+fr.toFixed(1)+'% | Power '+d.cl_pwr+'/'+d.cl_bpwr+' mW | RPM '+d.cl_rpm+'/'+d.cl_brpm+' (live/air)';}else{de.innerText='| Live Diff: n/a';}}"
+"if(typeof drawCalChart==='function')drawCalChart();"
 "pts.push(d);"
 "if(pts.length>MAX_PTS)pts.shift();"
 "document.getElementById('v-rpm').innerText=d.rpm;"
@@ -1938,6 +2109,79 @@ static const char INDEX_HTML[] =
 "let cnt=5;const tm=setInterval(()=>{cnt--;const el=document.getElementById('cd');if(el)el.innerText=cnt;if(cnt<=0){clearInterval(tm);window.location.reload();}},1000);"
 "}"
 "loadCsvList();"
+"(function(){"
+"const card=document.createElement('div');card.className='box';"
+"card.innerHTML='<div class=\"box-title\">Air Calibration &amp; Closed-Loop Control</div>'"
+"+'<div style=\"display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:10px\">'"
+"+'<button class=\"btn\" onclick=\"startAirCal()\">Run Air Calibration (Formats SD)</button>'"
+"+'<span id=\"cl-badge\" class=\"badge\">Closed-Loop: --</span>'"
+"+'<span id=\"cal-stat\" style=\"color:#aaa;font-size:13px\">Loading...</span>'"
+"+'<span id=\"cl-diff\" style=\"color:#4fc3f7;font-size:13px;font-weight:bold\"></span></div>'"
+"+'<canvas id=\"calChart\" width=\"1280\" height=\"720\" style=\"width:100%;height:480px;background:#1a1a1a;border-radius:6px;margin-bottom:10px\"></canvas>'"
+"+'<div style=\"display:grid;grid-template-columns:repeat(6,1fr);gap:8px;font-size:12px\">'"
+"+'<style>.cl-in{width:100%;box-sizing:border-box;margin-top:2px;}</style>'"
+"+'<label>Enabled (0/1)<input class=\"cl-in\" id=\"cl-en\" type=\"number\" min=\"0\" max=\"1\"></label>'"
+"+'<label>Target Max RPM<input class=\"cl-in\" id=\"cl-tmax\" type=\"number\"></label>'"
+"+'<label>Lower RPM Clip<input class=\"cl-in\" id=\"cl-clip\" type=\"number\"></label>'"
+"+'<label>Start PWM %<input class=\"cl-in\" id=\"cl-spwm\" type=\"number\" min=\"0\" max=\"100\"></label>'"
+"+'<label>Check Up (s)<input class=\"cl-in\" id=\"cl-cup\" type=\"number\" min=\"1\" max=\"60\"></label>'"
+"+'<label>Check Down (s)<input class=\"cl-in\" id=\"cl-cdn\" type=\"number\" min=\"1\" max=\"60\"></label>'"
+"+'<label>Gain Up %<input class=\"cl-in\" id=\"cl-gup\" type=\"number\" min=\"1\" max=\"50\"></label>'"
+"+'<label>Gain Down %<input class=\"cl-in\" id=\"cl-gdn\" type=\"number\" min=\"1\" max=\"50\"></label>'"
+"+'<label>Up Thresh %<input class=\"cl-in\" id=\"cl-uth\" type=\"number\"></label>'"
+"+'<label>Down Thresh %<input class=\"cl-in\" id=\"cl-dth\" type=\"number\"></label>'"
+"+'<label>RPM Shift %<input class=\"cl-in\" id=\"cl-rsh\" type=\"number\" min=\"-50\" max=\"50\"></label>'"
+"+'<label>Power Shift %<input class=\"cl-in\" id=\"cl-psh\" type=\"number\" min=\"-50\" max=\"50\"></label>'"
+"+'<label>RPM Drop % (water)<input class=\"cl-in\" id=\"cl-rdp\" type=\"number\" min=\"0\" max=\"50\"></label>'"
+"+'</div><button class=\"btn\" style=\"margin-top:8px\" onclick=\"saveCL()\">Apply Closed-Loop</button>';"
+"document.querySelectorAll('.box').forEach(b=>{const t=b.querySelector('.box-title');if(t&&(t.textContent.includes('4-Stage PWM')||t.textContent.includes('Dry-Run')||t.textContent.includes('Motor RPM History')))b.style.display='none';if(t&&t.textContent.includes('Voltage'))t.innerHTML='Voltage, Current &amp; Motor RPM History (Dual Y-Axis)';});"
+"const bt=document.getElementById('badge-throt');if(bt)bt.style.display='none';"
+"document.body.appendChild(card);"
+"})();"
+"let calData=null;"
+"function startAirCal(){if(!confirm('Format SD card and run 0-100% air calibration?'))return;fetch('/api/cal_start').then(()=>pollCal());}"
+"function saveCL(){"
+"const q='enabled='+document.getElementById('cl-en').value+'&target_max_rpm='+document.getElementById('cl-tmax').value"
+"+'&lower_rpm_clip='+document.getElementById('cl-clip').value+'&start_pwm_pct='+document.getElementById('cl-spwm').value"
+"+'&check_up_sec='+document.getElementById('cl-cup').value+'&check_down_sec='+document.getElementById('cl-cdn').value"
+"+'&gain_up_pct='+document.getElementById('cl-gup').value+'&gain_down_pct='+document.getElementById('cl-gdn').value"
+"+'&up_thresh_pct='+document.getElementById('cl-uth').value+'&dn_thresh_pct='+document.getElementById('cl-dth').value"
+"+'&cal_rpm_shift_pct='+document.getElementById('cl-rsh').value+'&cal_pwr_shift_pct='+document.getElementById('cl-psh').value+'&rpm_drop_pct='+document.getElementById('cl-rdp').value;"
+"fetch('/api/closed_loop?'+q).then(()=>pollCal());"
+"}"
+"function drawCalChart(){"
+"const c=document.getElementById('calChart');if(!c||!calData)return;const ctx=c.getContext('2d');const W=c.width,H=c.height;"
+"ctx.clearRect(0,0,W,H);ctx.fillStyle='#1a1a1a';ctx.fillRect(0,0,W,H);"
+"const pts=calData.points||[];if(pts.length<2)return;"
+"const maxR=calData.max_rpm_103_ceil||5500;let maxP=100;pts.forEach(p=>{if(p.pwr>maxP)maxP=p.pwr;});maxP=Math.ceil(maxP*1.1);"
+"const px=pwm=>40+(pwm/100)*(W-80),pyR=r=>H-25-(r/maxR)*(H-45),pyP=p=>H-25-(p/maxP)*(H-45);"
+"ctx.strokeStyle='#4fc3f7';ctx.lineWidth=2;ctx.beginPath();pts.forEach((p,i)=>{const x=px(p.pwm),y=pyR(p.rpm);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();"
+"ctx.strokeStyle='#ffb74d';ctx.lineWidth=2;ctx.beginPath();pts.forEach((p,i)=>{const x=px(p.pwm),y=pyP(p.pwr);if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});ctx.stroke();"
+"if(typeof pts!=='undefined'&&window.lastLive){const lp=window.lastLive;ctx.fillStyle='#66bb6a';ctx.beginPath();ctx.arc(px(lp.pwm),pyR(lp.rpm),5,0,Math.PI*2);ctx.fill();ctx.fillStyle='#ef5350';ctx.beginPath();ctx.arc(px(lp.pwm),pyP(lp.pwr),5,0,Math.PI*2);ctx.fill();"
+"let bR=0,bP=0;const lpw=Math.max(lp.pwm,pts[0].pwm);for(let i=0;i<pts.length-1;i++){if(lpw>=pts[i].pwm&&lpw<=pts[i+1].pwm){const f=(lpw-pts[i].pwm)/(pts[i+1].pwm-pts[i].pwm);bR=pts[i].rpm+f*(pts[i+1].rpm-pts[i].rpm);bP=pts[i].pwr+f*(pts[i+1].pwr-pts[i].pwr);break;}}"
+"if(calData.cl){bR=bR*(100+(calData.cl.cal_rpm_shift_pct||0))/100;bP=bP*(100+(calData.cl.cal_pwr_shift_pct||0))/100;}"
+"const dP=bP>0?((lp.pwr-bP)*100/bP).toFixed(1):'0.0';const dR=bR>0?((lp.rpm-bR)*100/bR).toFixed(1):'0.0';"
+"}"
+"}"
+"function pollCal(){"
+"fetch('/api/cal_data').then(r=>r.json()).then(d=>{"
+"calData=d;"
+"const st=document.getElementById('cal-stat');"
+"const cb=document.getElementById('cl-badge');"
+"if(cb&&d.cl){cb.className=d.cl.enabled?'badge ok':'badge';cb.innerText=d.cl.enabled?'Closed-Loop: ON':'Closed-Loop: OFF';}"
+"if(st)st.innerText=d.active?('Calibrating step '+d.step+'/" STRINGIFY(AIR_CAL_POINTS) "...'):(d.valid?('Saved (Max 103% ceil: '+d.max_rpm_103_ceil+' RPM)'):'Not calibrated');"
+"if(d.cl&&!document.activeElement.id.startsWith('cl-')){"
+"document.getElementById('cl-en').value=d.cl.enabled;document.getElementById('cl-tmax').value=d.cl.target_max_rpm;"
+"document.getElementById('cl-clip').value=d.cl.lower_rpm_clip;document.getElementById('cl-spwm').value=d.cl.start_pwm_pct;"
+"document.getElementById('cl-cup').value=d.cl.check_up_sec;document.getElementById('cl-cdn').value=d.cl.check_down_sec;"
+"document.getElementById('cl-gup').value=d.cl.gain_up_pct;document.getElementById('cl-gdn').value=d.cl.gain_down_pct;"
+"document.getElementById('cl-uth').value=d.cl.up_thresh_pct;document.getElementById('cl-dth').value=d.cl.dn_thresh_pct;"
+"document.getElementById('cl-rsh').value=d.cl.cal_rpm_shift_pct;document.getElementById('cl-psh').value=d.cl.cal_pwr_shift_pct;document.getElementById('cl-rdp').value=d.cl.rpm_drop_pct;"
+"}"
+"drawCalChart();"
+"}).catch(()=>{});"
+"}"
+"pollCal();setInterval(pollCal,2000);"
 "</script></body></html>";
 
 static int get_query_param_int(const char *req, const char *param, int default_val)
@@ -2692,6 +2936,55 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"stopped\"}\r\n";
 					send_all(client_fd, res, strlen(res));
 					close(client_fd);
+				} else if (strncmp(rx_buf, "GET /api/cal_start", 18) == 0) {
+					g_air_cal_requested = true;
+					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"started\"}";
+					send_all(client_fd, res, strlen(res));
+					close(client_fd);
+				} else if (strncmp(rx_buf, "GET /api/cal_data", 17) == 0) {
+					static char cal_json[2048];
+					int pos = snprintf(cal_json, sizeof(cal_json),
+						"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n"
+						"{\"valid\":%s,\"active\":%s,\"step\":%u,\"max_rpm_103_ceil\":%u,"
+						"\"cl\":{\"enabled\":%u,\"target_max_rpm\":%u,\"lower_rpm_clip\":%u,\"start_pwm_pct\":%u,"
+						"\"check_up_sec\":%u,\"check_down_sec\":%u,\"gain_up_pct\":%u,\"gain_down_pct\":%u,"
+						"\"up_thresh_pct\":%d,\"dn_thresh_pct\":%d,\"cal_rpm_shift_pct\":%d,\"cal_pwr_shift_pct\":%d,\"rpm_drop_pct\":%u},"
+						"\"points\":[",
+						g_air_cal.valid ? "true" : "false",
+						g_air_cal_active ? "true" : "false",
+						g_air_cal_step_idx, g_air_cal.max_rpm_103_ceil,
+						g_closed_loop_cfg.enabled, g_closed_loop_cfg.target_max_rpm,
+						g_closed_loop_cfg.lower_rpm_clip, g_closed_loop_cfg.start_pwm_pct,
+						g_closed_loop_cfg.check_up_sec, g_closed_loop_cfg.check_down_sec,
+						g_closed_loop_cfg.gain_up_pct, g_closed_loop_cfg.gain_down_pct,
+						g_closed_loop_cfg.up_thresh_pct, g_closed_loop_cfg.dn_thresh_pct,
+						g_closed_loop_cfg.cal_rpm_shift_pct, g_closed_loop_cfg.cal_pwr_shift_pct, g_closed_loop_cfg.rpm_drop_pct);
+					for (int i = 0; i < AIR_CAL_POINTS && pos < (int)sizeof(cal_json) - 64; i++) {
+						pos += snprintf(cal_json + pos, sizeof(cal_json) - pos,
+							"%s{\"pwm\":%u,\"rpm\":%u,\"pwr\":%u}",
+							(i > 0) ? "," : "",
+							g_air_cal.pts[i].pwm_pct, g_air_cal.pts[i].rpm, g_air_cal.pts[i].power_mw);
+					}
+					snprintf(cal_json + pos, sizeof(cal_json) - pos, "]}");
+					send_all(client_fd, cal_json, strlen(cal_json));
+					close(client_fd);
+				} else if (strncmp(rx_buf, "GET /api/closed_loop", 20) == 0) {
+					g_closed_loop_cfg.enabled = (uint8_t)get_query_param_int(rx_buf, "enabled", g_closed_loop_cfg.enabled);
+					g_closed_loop_cfg.target_max_rpm = (uint16_t)get_query_param_int(rx_buf, "target_max_rpm", g_closed_loop_cfg.target_max_rpm);
+					g_closed_loop_cfg.lower_rpm_clip = (uint16_t)get_query_param_int(rx_buf, "lower_rpm_clip", g_closed_loop_cfg.lower_rpm_clip);
+					g_closed_loop_cfg.start_pwm_pct = (uint8_t)get_query_param_int(rx_buf, "start_pwm_pct", g_closed_loop_cfg.start_pwm_pct);
+					g_closed_loop_cfg.check_up_sec = (uint8_t)get_query_param_int(rx_buf, "check_up_sec", g_closed_loop_cfg.check_up_sec);
+					g_closed_loop_cfg.check_down_sec = (uint8_t)get_query_param_int(rx_buf, "check_down_sec", g_closed_loop_cfg.check_down_sec);
+					g_closed_loop_cfg.gain_up_pct = (uint8_t)get_query_param_int(rx_buf, "gain_up_pct", g_closed_loop_cfg.gain_up_pct);
+					g_closed_loop_cfg.gain_down_pct = (uint8_t)get_query_param_int(rx_buf, "gain_down_pct", g_closed_loop_cfg.gain_down_pct);
+					g_closed_loop_cfg.up_thresh_pct = (int16_t)get_query_param_int(rx_buf, "up_thresh_pct", g_closed_loop_cfg.up_thresh_pct);
+					g_closed_loop_cfg.dn_thresh_pct = (int16_t)get_query_param_int(rx_buf, "dn_thresh_pct", g_closed_loop_cfg.dn_thresh_pct);
+					g_closed_loop_cfg.cal_rpm_shift_pct = (int8_t)get_query_param_int(rx_buf, "cal_rpm_shift_pct", g_closed_loop_cfg.cal_rpm_shift_pct);
+					g_closed_loop_cfg.cal_pwr_shift_pct = (int8_t)get_query_param_int(rx_buf, "cal_pwr_shift_pct", g_closed_loop_cfg.cal_pwr_shift_pct);
+					g_closed_loop_cfg.rpm_drop_pct = (uint8_t)get_query_param_int(rx_buf, "rpm_drop_pct", g_closed_loop_cfg.rpm_drop_pct);
+					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{\"status\":\"ok\"}";
+					send_all(client_fd, res, strlen(res));
+					close(client_fd);
 				} else if (strncmp(rx_buf, "POST /api/throttle/config", 25) == 0 ||
 				           strncmp(rx_buf, "GET /api/throttle/config", 24) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
@@ -2817,7 +3110,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 
 			char sse_data[420];
 			int sse_len = snprintf(sse_data, sizeof(sse_data),
-			                       "data: {\"id\":%u,\"rpm\":%u,\"pwm\":%u,\"stage\":%u,\"prof_sec\":%u,\"prof_tot\":%u,\"throt\":%u,\"throt_drop\":%u,\"throt_brpm\":%u,\"throt_bma\":%d,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s}\n\n",
+			                       "data: {\"id\":%u,\"rpm\":%u,\"pwm\":%u,\"stage\":%u,\"prof_sec\":%u,\"prof_tot\":%u,\"throt\":%u,\"throt_drop\":%u,\"throt_brpm\":%u,\"throt_bma\":%d,\"temp\":%d.%d,\"volt\":%u.%02u,\"curr\":%d,\"uptime\":%lld,\"time\":\"%s\",\"clients\":%d,\"ntp\":%s,\"cl_ok\":%d,\"cl_pwr\":%u,\"cl_bpwr\":%u,\"cl_rpm\":%u,\"cl_brpm\":%u,\"cl_dp\":%d,\"cl_dr\":%d}\n\n",
 			                       cur.sample_id, cur.motor_rpm, cur.pwm_pct, cur.profile_stage,
 			                       cur.profile_elapsed_sec, cur.profile_total_sec,
 			                       cur.throttle_active, cur.throttle_drop_pct,
@@ -2825,7 +3118,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 			                       cur.temp_mc / 1000, abs(cur.temp_mc % 1000) / 100,
 			                       cur.bus_mv / 1000, (cur.bus_mv % 1000) / 10,
 			                       cur.current_ma, (long long)cur.uptime_ms, cur.iso_time,
-			                       active_clients, ntp_synced ? "true" : "false");
+			                       active_clients, ntp_synced ? "true" : "false",
+			                       g_cl_ok, g_cl_live_pwr_mw, g_cl_base_pwr_mw, g_cl_live_rpm, g_cl_base_rpm,
+			                       g_cl_pwr_diff_x10, g_cl_rpm_diff_x10);
 
 			for (int i = 0; i < MAX_SSE_CLIENTS; i++) {
 				if (sse_clients[i].fd >= 0 && sse_clients[i].last_sent_id != cur.sample_id) {
