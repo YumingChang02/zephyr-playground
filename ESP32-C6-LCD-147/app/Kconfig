@@ -66,6 +66,23 @@ config APP_MAX_FG_RPM
 	help
 	  Maximum RPM representing 100% on the LCD display bar and web chart.
 
+config APP_MOTOR_KICK_RESET_MS
+	int "Pre-kick 0% PWM reset delay (ms)"
+	default 200
+	range 0 10000
+	help
+	  Duration in milliseconds to hold 0% PWM before applying a spin-up or
+	  stall-recovery kick, allowing the motor ESC to clear any locked-rotor
+	  stall protection latch. Set to 0 to disable the 0% reset delay.
+
+config APP_MOTOR_KICK_PWM_PCT
+	int "Spin-up / stall recovery kick PWM (%)"
+	default 10
+	range 0 100
+	help
+	  Minimum PWM duty cycle percentage applied during spin-up and
+	  stall-recovery kicks until the motor spins.
+
 endmenu
 
 source "Kconfig.zephyr"

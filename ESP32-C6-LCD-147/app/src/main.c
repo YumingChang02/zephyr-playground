@@ -35,6 +35,11 @@
 #include <time.h>
 
 #include <zephyr/sys/reboot.h>
+#include <soc/ledc_struct.h>
+#include <soc/gpio_struct.h>
+#include <soc/io_mux_reg.h>
+#include <soc/lp_aon_struct.h>
+#include <esp_cpu.h>
 #include "telemetry.h"
 
 /* POSIX socket aliases */
@@ -94,11 +99,12 @@
 #define PWM_MOTOR_NODE  DT_ALIAS(motor_pwm)
 #define FG_PIN_NODE     DT_ALIAS(fg_pin)
 #define LCD_BL_PWM_NODE DT_ALIAS(lcd_bl_pwm)
-#define LCD_BL_PCT      45
+#define LCD_BL_PCT      30
 
 static const struct pwm_dt_spec pwm_motor  = PWM_DT_SPEC_GET(PWM_MOTOR_NODE);
 static const struct pwm_dt_spec pwm_lcd_bl = PWM_DT_SPEC_GET(LCD_BL_PWM_NODE);
 static const struct gpio_dt_spec fg_spec   = GPIO_DT_SPEC_GET(FG_PIN_NODE, gpios);
+static const struct gpio_dt_spec rgb_spec  = GPIO_DT_SPEC_GET(DT_ALIAS(rgb_led), gpios);
 static const struct device *display_dev    = DEVICE_DT_GET(DT_CHOSEN(zephyr_display));
 
 /* ========================================================================= */
@@ -185,6 +191,10 @@ static volatile uint8_t  g_prof_stage = PROFILE_STAGE_LOW;
 static volatile uint16_t g_prof_elapsed_sec = 0;
 static volatile uint16_t g_prof_total_sec = DEFAULT_PROF_TOTAL;
 static volatile uint32_t g_active_pwm_pct = 0;
+static volatile bool     g_prof_log_pending = false;
+static volatile uint32_t g_prof_ctrl_rx_count = 0;
+static volatile uint8_t  g_last_ctrl_action = PWM_ACTION_START_PROFILE;
+static volatile uint8_t  g_last_ctrl_manual_pwm = 0;
 
 static pwm_throttle_ctrl_t g_throttle_cfg = {
 	.enabled = DEFAULT_THROTTLE_ENABLED,
@@ -194,6 +204,7 @@ static pwm_throttle_ctrl_t g_throttle_cfg = {
 	.curr_drop_pct = DEFAULT_THROTTLE_CURR_DROP_PCT,
 	.cooldown_sec = DEFAULT_THROTTLE_COOLDOWN_SEC,
 };
+static volatile bool     g_throttle_log_pending = false;
 
 /* Real-Time Display Shared Values */
 static volatile uint32_t g_disp_pwm_pct = 0;
@@ -392,7 +403,32 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
 		pwm_profile_ctrl_t cfg = g_prof_cfg;
 		pwm_throttle_ctrl_t throt_cfg = g_throttle_cfg;
+		bool prof_log_pending = g_prof_log_pending;
+		g_prof_log_pending = false;
+		bool throt_log_pending = g_throttle_log_pending;
+		g_throttle_log_pending = false;
+		uint32_t ctrl_rx_cnt = g_prof_ctrl_rx_count;
+		uint8_t last_action = g_last_ctrl_action;
+		uint8_t last_manual = g_last_ctrl_manual_pwm;
 		k_spin_unlock(&profile_spinlock, pkey);
+
+		if (throt_log_pending) {
+			printk("[Thread 1] Throttle Cfg: en=%u max_drop=%u%% slope=%u%%/s rpm_rise=%u%% curr_drop=%u%% cooldown=%us\n",
+			       throt_cfg.enabled, throt_cfg.max_drop_pct, throt_cfg.slope_pct_per_sec,
+			       throt_cfg.rpm_rise_pct, throt_cfg.curr_drop_pct, throt_cfg.cooldown_sec);
+		}
+
+		if (prof_log_pending) {
+			const char *act_str = "UNKNOWN";
+			if (last_action == PWM_ACTION_SET_CONFIG_ONLY) act_str = "SET_CFG";
+			else if (last_action == PWM_ACTION_START_PROFILE) act_str = "START";
+			else if (last_action == PWM_ACTION_STOP_PROFILE) act_str = "STOP";
+			else if (last_action == PWM_ACTION_MANUAL_PWM) act_str = "MANUAL";
+			printk("[Thread 1] PWM Profile Ctrl #%u (%s, man=%u%%): low=%u%%(%us), up=%us, high=%u%%(%us), drop=%us, total=%us\n",
+			       ctrl_rx_cnt, act_str, last_manual,
+			       cfg.p_low_pct, cfg.t_low_sec, cfg.t_up_sec, cfg.p_high_pct, cfg.t_high_sec, cfg.t_drop_sec,
+			       cfg.t_low_sec + cfg.t_up_sec + cfg.t_high_sec + cfg.t_drop_sec);
+		}
 
 		uint32_t target_pwm = 0;
 		uint8_t stage = PROFILE_STAGE_IDLE;
@@ -451,6 +487,14 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 			target_pwm = 0;
 		}
 
+		static uint8_t s_prev_stage = 0xFF;
+		if (stage != s_prev_stage) {
+			printk("[Thread 1] PWM Stage: %u -> %u (elapsed=%u/%us, target=%u%%, synced=%d, sod=%u)\n",
+			       s_prev_stage, stage, prof_elapsed, (uint16_t)total,
+			       target_pwm, synced ? 1 : 0, cur_sec_of_day);
+			s_prev_stage = stage;
+		}
+
 		if (target_pwm > 100) target_pwm = 100;
 
 		/* Calculate Motor RPM */
@@ -475,6 +519,92 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		g_disp_rpm = ema_rpm;
 
 		/* ----------------------------------------------------------------- */
+		/* Spin-Up & Stall Recovery Kick: 0% ESC reset -> 50% PWM kick       */
+		/* ----------------------------------------------------------------- */
+		enum {
+			KICK_STATE_IDLE = 0,
+			KICK_STATE_RESET_WAIT = 1,
+			KICK_STATE_KICKING = 2,
+		};
+		static uint8_t s_kick_state = KICK_STATE_IDLE;
+		static int64_t s_kick_state_start_ms = 0;
+		static int64_t s_last_kick_retry_ms = 0;
+		static int64_t s_zero_pwm_since_ms = 0;
+
+		if (target_pwm > 0) {
+			if (s_kick_state == KICK_STATE_IDLE) {
+				if (ema_rpm == 0 && raw_rpm == 0) {
+					bool already_reset = (CONFIG_APP_MOTOR_KICK_RESET_MS == 0) ||
+						(s_zero_pwm_since_ms > 0 &&
+						 (current_time_ms - s_zero_pwm_since_ms) >= (int64_t)CONFIG_APP_MOTOR_KICK_RESET_MS);
+					if (already_reset) {
+						if (current_time_ms - s_last_kick_retry_ms > 500LL) {
+							s_kick_state = KICK_STATE_KICKING;
+							s_kick_state_start_ms = current_time_ms;
+							printk("[Thread 1] Motor Kick/Stall Recovery Started: target=%u%% -> applying %u%% until spinning\n",
+							       target_pwm, (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT);
+						}
+					} else {
+						s_kick_state = KICK_STATE_RESET_WAIT;
+						s_kick_state_start_ms = current_time_ms;
+						printk("[Thread 1] Motor Stall Detected: target=%u%% -> holding 0%% for %d ms to reset ESC latch\n",
+						       target_pwm, CONFIG_APP_MOTOR_KICK_RESET_MS);
+					}
+				}
+			} else if (s_kick_state == KICK_STATE_RESET_WAIT) {
+				if (raw_rpm > 0U || current_pulses > 0U) {
+					s_kick_state = KICK_STATE_IDLE;
+				} else if ((current_time_ms - s_kick_state_start_ms) >= (int64_t)CONFIG_APP_MOTOR_KICK_RESET_MS) {
+					s_kick_state = KICK_STATE_KICKING;
+					s_kick_state_start_ms = current_time_ms;
+					printk("[Thread 1] Motor Kick/Stall Recovery Started: target=%u%% -> applying %u%% until spinning\n",
+					       target_pwm, (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT);
+				}
+			} else if (s_kick_state == KICK_STATE_KICKING) {
+				int64_t kick_duration = current_time_ms - s_kick_state_start_ms;
+				/* Require at least 400ms kick duration so rotor overcomes inertia */
+				if (kick_duration >= 400LL && (raw_rpm >= 300U || current_pulses >= 2U)) {
+					s_kick_state = KICK_STATE_IDLE;
+					s_last_kick_retry_ms = current_time_ms;
+					printk("[Thread 1] Motor Kick Succeeded: raw_rpm=%u, ema=%u (took %lld ms) -> resuming target=%u%%\n",
+					       raw_rpm, ema_rpm, (long long)kick_duration, target_pwm);
+				} else if (kick_duration > 3000LL) {
+					/* Timeout after 3.0s to protect mechanically jammed motor */
+					s_last_kick_retry_ms = current_time_ms;
+					if (CONFIG_APP_MOTOR_KICK_RESET_MS > 0) {
+						s_kick_state = KICK_STATE_RESET_WAIT;
+						s_kick_state_start_ms = current_time_ms;
+						printk("[Thread 1] Motor Kick Timeout (3s, rpm=0) -> resetting PWM to 0%% for %d ms before retry\n",
+						       CONFIG_APP_MOTOR_KICK_RESET_MS);
+					} else {
+						s_kick_state = KICK_STATE_IDLE;
+						printk("[Thread 1] Motor Kick Timeout (3s, rpm=0) -> yielding to target=%u%% before retry\n", target_pwm);
+					}
+				}
+			}
+		} else {
+			s_kick_state = KICK_STATE_IDLE;
+		}
+
+		/* Apply 0% during ESC reset wait, >=CONFIG_APP_MOTOR_KICK_PWM_PCT while kicking, otherwise target_pwm */
+		uint32_t effective_pwm = target_pwm;
+		if (s_kick_state == KICK_STATE_RESET_WAIT) {
+			effective_pwm = 0U;
+		} else if (s_kick_state == KICK_STATE_KICKING) {
+			effective_pwm = (target_pwm < (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT)
+				? (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT
+				: target_pwm;
+		}
+
+		if (effective_pwm == 0U) {
+			if (s_zero_pwm_since_ms == 0) {
+				s_zero_pwm_since_ms = current_time_ms;
+			}
+		} else {
+			s_zero_pwm_since_ms = 0;
+		}
+
+		/* ----------------------------------------------------------------- */
 		/* Dry-Run / Air-Draw PWM Throttling State Machine                   */
 		/* ----------------------------------------------------------------- */
 		static uint8_t  s_throt_state = THROTTLE_STATE_NORMAL;
@@ -487,7 +617,7 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 		static uint8_t  s_trig_hits = 0;
 		static int64_t  s_hold_until_ms = 0;
 
-		uint32_t unthrottled_pwm = target_pwm;
+		uint32_t unthrottled_pwm = effective_pwm;
 		int32_t cur_ma = g_disp_current_ma;
 
 		if (!throt_cfg.enabled || unthrottled_pwm == 0) {
@@ -612,12 +742,40 @@ static void motor_speed_thread_fn(void *p1, void *p2, void *p3)
 			if (pwm_motor.dev && device_is_ready(pwm_motor.dev)) {
 				uint32_t pulse_ns = (uint32_t)(((uint64_t)pwm_motor.period * duty_cycle_pct) / 100ULL);
 				int ret = pwm_set_dt(&pwm_motor, pwm_motor.period, pulse_ns);
+				uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_r >> 4;
+				uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+				uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
 				if (ret == 0) {
 					s_applied_pwm_pct = duty_cycle_pct;
 				}
+				printk("[Thread 1] PWM HW Apply: target=%u%% (pulse=%u ns) -> ret=%d [LEDC reg: duty=%u, sig_en=%u, idle_lv=%u]\n",
+				       duty_cycle_pct, pulse_ns, ret, hw_duty, sig_en, idle_lv);
+			} else {
+				printk("[Thread 1] PWM ERROR: pwm_motor device NOT ready!\n");
 			}
 		}
 		g_disp_pwm_pct = duty_cycle_pct;
+
+		if ((sample_seq % (CONFIG_APP_SAMPLE_RATE_HZ * 2)) == 0) {
+			uint32_t hw_duty = LEDC.channel_group[0].channel[0].duty_rd.duty_r >> 4;
+			uint32_t sig_en = LEDC.channel_group[0].channel[0].conf0.sig_out_en;
+			uint32_t idle_lv = LEDC.channel_group[0].channel[0].conf0.idle_lv;
+			uint32_t out_sel = GPIO.func_out_sel_cfg[0].out_sel;
+			uint32_t oen_sel = GPIO.func_out_sel_cfg[0].oen_sel;
+			uint32_t lp_mux = LP_AON.gpio_mux.gpio_mux_sel;
+			uint32_t io_mux_g0 = REG_READ(IO_MUX_GPIO0_REG);
+			printk("[Thread 1] PWM Debug: seq=%u stage=%u (%u/%us) target=%u%% applied=%u%% throt=%u(-%u%%) base=%uRPM/%dmA rx=%u [LEDC duty=%u sig=%u idle=%u] [GPIO0: out_sel=%u oen=%u lp_mux=0x%x io_mux=0x%x]\n",
+			       sample_seq, stage, prof_elapsed, (uint16_t)total,
+			       duty_cycle_pct, s_applied_pwm_pct, s_throt_state, drop_pct,
+			       base_rpm_snap, base_ma_snap, ctrl_rx_cnt, hw_duty, sig_en, idle_lv,
+			       out_sel, oen_sel, lp_mux, io_mux_g0);
+		}
+
+		if ((sample_seq % 6) == 0 && fg_spec.port && device_is_ready(fg_spec.port)) {
+			int current_level = gpio_pin_get_dt(&fg_spec);
+			printk("[Thread 1] Motor: PWM %u%% | Pulses: %u in %u ms (total: %llu) | Raw: %u | Smoothed RPM: %u | FG line: %d\n",
+			       duty_cycle_pct, current_pulses, (uint32_t)elapsed_ms, (unsigned long long)g_total_pulses, raw_rpm, ema_rpm, current_level);
+		}
 
 		motor_speed_sample_t sample = {
 			.pulse_count = current_pulses,
@@ -765,7 +923,7 @@ static const uint8_t font_6x11[24][11] = {
 	/* 8 */ { 0x1E, 0x33, 0x33, 0x33, 0x1E, 0x33, 0x33, 0x33, 0x33, 0x33, 0x1E },
 	/* 9 */ { 0x1E, 0x33, 0x33, 0x33, 0x1F, 0x03, 0x03, 0x03, 0x03, 0x33, 0x1E },
 	/* / */ { 0x01, 0x03, 0x06, 0x06, 0x0C, 0x0C, 0x18, 0x18, 0x30, 0x30, 0x20 },
-	/* : */ { 0x00, 0x00, 0x1E, 0x1E, 0x00, 0x00, 0x00, 0x1E, 0x1E, 0x00, 0x00 },
+	/* : */ { 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x0C, 0x0C, 0x00, 0x00 },
 	/* - */ { 0x00, 0x00, 0x00, 0x00, 0x00, 0x3F, 0x00, 0x00, 0x00, 0x00, 0x00 },
 	/* + */ { 0x00, 0x00, 0x0C, 0x0C, 0x0C, 0x3F, 0x0C, 0x0C, 0x0C, 0x00, 0x00 },
 	/* N */ { 0x33, 0x33, 0x3B, 0x3B, 0x37, 0x37, 0x33, 0x33, 0x33, 0x33, 0x33 },
@@ -803,26 +961,73 @@ static int font_char_index(char c)
 	}
 }
 
-static void draw_string(uint16_t *buf, int buf_w, int buf_h,
-                        int start_x, int start_y, const char *str,
-                        uint16_t text_color)
+static void font_char_span(char c, int *col_start, int *col_width)
+{
+	switch (c) {
+	case ':':
+	case '\'':
+		*col_start = 2;
+		*col_width = 2;
+		break;
+	case '"':
+		*col_start = 0;
+		*col_width = 4;
+		break;
+	case ' ':
+		*col_start = 0;
+		*col_width = 2;
+		break;
+	default:
+		*col_start = 0;
+		*col_width = 6;
+		break;
+	}
+}
+
+static int measure_string_scaled(const char *str, int scale, int gap_px)
+{
+	int w = 0;
+	bool first = true;
+	while (*str) {
+		int col_start, col_width;
+		font_char_span(*str++, &col_start, &col_width);
+		if (!first) {
+			w += gap_px;
+		}
+		w += col_width * scale;
+		first = false;
+	}
+	return w;
+}
+
+static void draw_string_scaled(uint16_t *buf, int buf_w, int buf_h,
+                               int start_x, int start_y, const char *str,
+                               uint16_t text_color, int scale, int gap_px)
 {
 	int cur_x = start_x;
 	while (*str) {
-		int idx = font_char_index(*str++);
+		char ch = *str++;
+		int idx = font_char_index(ch);
+		int col_start, col_width;
+		font_char_span(ch, &col_start, &col_width);
 		for (int r = 0; r < 11; r++) {
-			int y = start_y + r;
-			if (y < 0 || y >= buf_h) continue;
 			uint8_t row_bits = font_6x11[idx][r];
-			for (int c = 0; c < 6; c++) {
-				int x = cur_x + c;
-				if (x < 0 || x >= buf_w) continue;
-				if ((row_bits >> (5 - c)) & 1) {
-					buf[y * buf_w + x] = text_color;
+			for (int c = 0; c < col_width; c++) {
+				if (!((row_bits >> (5 - (col_start + c))) & 1)) {
+					continue;
+				}
+				for (int sy = 0; sy < scale; sy++) {
+					int y = start_y + r * scale + sy;
+					if (y < 0 || y >= buf_h) continue;
+					for (int sx = 0; sx < scale; sx++) {
+						int x = cur_x + c * scale + sx;
+						if (x < 0 || x >= buf_w) continue;
+						buf[y * buf_w + x] = text_color;
+					}
 				}
 			}
 		}
-		cur_x += 7;
+		cur_x += col_width * scale + gap_px;
 	}
 }
 
@@ -890,22 +1095,23 @@ static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
 	}
 	snprintf(time_str, sizeof(time_str), "%02u:%02u:%02u", hour, min, sec);
 
-	/* Top Sync Indicator (at y = 20) */
-	if (is_synced) {
-		draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 37, 20, "NTP", rgb565(0, 50, 10));
-	} else {
-		draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 33, 20, "SYNC", rgb565(20, 25, 0));
-	}
+	/* Top Sync Indicator (at y = 14, 2x scale: 12x22) */
+	const char *sync_str = is_synced ? "NTP" : "SYNC";
+	uint16_t sync_col = is_synced ? rgb565(0, 50, 10) : rgb565(20, 25, 0);
+	int sync_x = (TIME_PANEL_W - measure_string_scaled(sync_str, 2, 2)) / 2;
+	draw_string_scaled(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, sync_x, 14, sync_str, sync_col, 2, 2);
 
-	/* Date MM/DD (5 chars * 7 - 1 = 34 px wide) -> centered in 94 px: (94 - 34) / 2 = 30 (at y = 56) */
+	/* Date MM/DD (at y = 52, 2x scale) */
 	uint16_t date_color = rgb565(0, 56, 31); /* Cool Mint / Cyan */
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 30, 56, date_str, date_color);
+	int date_x = (TIME_PANEL_W - measure_string_scaled(date_str, 2, 2)) / 2;
+	draw_string_scaled(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, date_x, 52, date_str, date_color, 2, 2);
 
-	/* Time HH:MM:SS (8 chars * 7 - 1 = 55 px wide) -> centered in 94 px: (94 - 55) / 2 = 19 (at y = 92) */
+	/* Time HH:MM:SS (at y = 90, 2x scale, 1px gap = 87px wide in 94px panel) */
 	uint16_t time_color = rgb565(31, 55, 0); /* Warm Amber / Gold */
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, 19, 92, time_str, time_color);
+	int time_x = (TIME_PANEL_W - measure_string_scaled(time_str, 2, 1)) / 2;
+	draw_string_scaled(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, time_x, 90, time_str, time_color, 2, 1);
 
-	/* Bottom: Stage Remaining Countdown MM' SS'' (at y = 130) */
+	/* Bottom: Stage Remaining Countdown MM' SS'' (at y = 128, 2x scale) */
 	uint16_t stage_col;
 	switch (stage) {
 	case PROFILE_STAGE_LOW:
@@ -936,13 +1142,12 @@ static void render_time_panel(int x, int y, uint8_t mon, uint8_t day,
 	} else {
 		snprintf(rem_str, sizeof(rem_str), "--' --''");
 	}
-	int str_len = strlen(rem_str);
-	int text_w = str_len * 7 - 1;
+	int text_w = measure_string_scaled(rem_str, 2, 1);
 	int start_x = (TIME_PANEL_W - text_w) / 2;
 	if (start_x < 2) {
 		start_x = 2;
 	}
-	draw_string(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, start_x, 130, rem_str, stage_col);
+	draw_string_scaled(g_time_buf, TIME_PANEL_W, TIME_PANEL_H, start_x, 128, rem_str, stage_col, 2, 1);
 
 	struct display_buffer_descriptor desc = {
 		.buf_size = sizeof(g_time_buf),
@@ -974,6 +1179,67 @@ static void clear_screen_black(void)
 	}
 }
 
+static inline void ws2812_delay_cycles(uint32_t start, uint32_t cycles)
+{
+	while ((uint32_t)(esp_cpu_get_cycle_count() - start) < cycles) {
+	}
+}
+
+static void ws2812_set_rgb(uint8_t r, uint8_t g, uint8_t b)
+{
+	if (!rgb_spec.port || !device_is_ready(rgb_spec.port)) {
+		return;
+	}
+	/* Waveshare ESP32-C6-LCD-1.47 onboard RGB LED expects RGB byte order */
+	uint32_t rgb = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+	uint32_t pin_mask = BIT(rgb_spec.pin);
+
+	unsigned int key = irq_lock();
+	for (int i = 23; i >= 0; i--) {
+		uint32_t start = esp_cpu_get_cycle_count();
+		GPIO.out_w1ts.val = pin_mask;
+		if ((rgb >> i) & 1U) {
+			/* '1' bit: ~800 ns high (128 cycles @ 160MHz), ~450 ns low (72 cycles) */
+			ws2812_delay_cycles(start, 128U);
+			GPIO.out_w1tc.val = pin_mask;
+			ws2812_delay_cycles(start, 200U);
+		} else {
+			/* '0' bit: ~350 ns high (56 cycles @ 160MHz), ~900 ns low (144 cycles) */
+			ws2812_delay_cycles(start, 56U);
+			GPIO.out_w1tc.val = pin_mask;
+			ws2812_delay_cycles(start, 200U);
+		}
+	}
+	irq_unlock(key);
+}
+
+static void update_stage_rgb_led(uint8_t stage)
+{
+	static uint8_t s_last_led_stage = 0xFF;
+	if (stage == s_last_led_stage) {
+		return;
+	}
+	s_last_led_stage = stage;
+
+	switch (stage) {
+	case PROFILE_STAGE_LOW:
+		ws2812_set_rgb(0, 36, 50);   /* Cyan / Sky Blue (Stage 1: Low) */
+		break;
+	case PROFILE_STAGE_UP:
+		ws2812_set_rgb(50, 28, 0);   /* Amber / Gold (Stage 2: Ramp Up) */
+		break;
+	case PROFILE_STAGE_HIGH:
+		ws2812_set_rgb(0, 50, 0);    /* Vibrant Green (Stage 3: High) */
+		break;
+	case PROFILE_STAGE_DROP:
+		ws2812_set_rgb(50, 0, 0);    /* Coral Red (Stage 4: Drop) */
+		break;
+	default:
+		ws2812_set_rgb(6, 6, 6);     /* Dim Grey (Idle) */
+		break;
+	}
+}
+
 static void display_thread_fn(void *p1, void *p2, void *p3)
 {
 	ARG_UNUSED(p1);
@@ -981,6 +1247,13 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 	ARG_UNUSED(p3);
 
 	printk("[Thread 3: LCD Engine] Started (Priority %d)\n", PRIORITY_DISPLAY);
+
+	if (rgb_spec.port && device_is_ready(rgb_spec.port)) {
+		gpio_pin_configure_dt(&rgb_spec, GPIO_OUTPUT_INACTIVE);
+		k_busy_wait(100);
+		update_stage_rgb_led(PROFILE_STAGE_IDLE);
+		printk("[Thread 3] Onboard WS2812 RGB LED initialized on GPIO %d\n", rgb_spec.pin);
+	}
 
 	if (!display_dev || !device_is_ready(display_dev)) {
 		printk("[Thread 3] Display device not ready!\n");
@@ -1097,6 +1370,8 @@ static void display_thread_fn(void *p1, void *p2, void *p3)
 		                  disp_hour, disp_min, disp_sec,
 		                  synced,
 		                  stage, rem_sec);
+
+		update_stage_rgb_led(stage);
 
 		k_msleep(100); /* 10 Hz refresh */
 	}
@@ -2369,6 +2644,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						g_prof_cfg.p_high_pct = get_query_param_int(rx_buf, "p_high", g_prof_cfg.p_high_pct);
 						g_prof_cfg.t_drop_sec = get_query_param_int(rx_buf, "t_drop", g_prof_cfg.t_drop_sec);
 					}
+					g_last_ctrl_action = PWM_ACTION_SET_CONFIG_ONLY;
+					g_prof_ctrl_rx_count++;
+					g_prof_log_pending = true;
 					pwm_profile_ctrl_t cfg = g_prof_cfg;
 					k_spin_unlock(&profile_spinlock, pkey);
 
@@ -2394,6 +2672,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						g_prof_cfg.t_drop_sec = get_query_param_int(rx_buf, "t_drop", g_prof_cfg.t_drop_sec);
 					}
 					g_prof_cfg.action = PWM_ACTION_START_PROFILE;
+					g_last_ctrl_action = PWM_ACTION_START_PROFILE;
+					g_prof_ctrl_rx_count++;
+					g_prof_log_pending = true;
 					k_spin_unlock(&profile_spinlock, pkey);
 
 					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"started\"}\r\n";
@@ -2403,6 +2684,9 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 				           strncmp(rx_buf, "GET /api/profile/stop", 21) == 0) {
 					k_spinlock_key_t pkey = k_spin_lock(&profile_spinlock);
 					g_prof_cfg.action = PWM_ACTION_STOP_PROFILE;
+					g_last_ctrl_action = PWM_ACTION_STOP_PROFILE;
+					g_prof_ctrl_rx_count++;
+					g_prof_log_pending = true;
 					k_spin_unlock(&profile_spinlock, pkey);
 
 					const char *res = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 17\r\nConnection: close\r\n\r\n{\"status\":\"stopped\"}\r\n";
@@ -2431,6 +2715,7 @@ static void wifi_http_thread_fn(void *p1, void *p2, void *p3)
 						g_throttle_cfg.rpm_rise_pct = (uint8_t)rr;
 						g_throttle_cfg.curr_drop_pct = (uint8_t)cd;
 						g_throttle_cfg.cooldown_sec = (uint8_t)co;
+						g_throttle_log_pending = true;
 					}
 					pwm_throttle_ctrl_t tc = g_throttle_cfg;
 					k_spin_unlock(&profile_spinlock, pkey);

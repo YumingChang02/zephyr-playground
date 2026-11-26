@@ -11,6 +11,7 @@
 		fg-pin = &fg_sensor;
 		lcd-bl = &lcd_backlight;
 		lcd-bl-pwm = &pwm_lcd_bl;
+		rgb-led = &rgb_led;
 	};
 
 	chosen {
@@ -37,6 +38,14 @@
 		};
 	};
 
+	rgb_leds {
+		compatible = "gpio-leds";
+		rgb_led: rgb_led_0 {
+			gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
+			label = "Onboard WS2812 RGB LED";
+		};
+	};
+
 	mipi_dbi {
 		compatible = "zephyr,mipi-dbi-spi";
 		spi-dev = <&spi2>;
@@ -59,7 +68,7 @@
 			gctrl = <0x35>;
 			vrhs = <0x12>;
 			vdvs = <0x20>;
-			mdac = <0x70>;
+			mdac = <0xa0>;
 			lcm = <0x2c>;
 			pixel-format = <PANEL_PIXEL_FORMAT_RGB_565>;
 			gamma = <0x01>;

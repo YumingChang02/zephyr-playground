@@ -477,6 +477,92 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 		uint32_t rpm = s_filtered_rpm;
 
 		/* ----------------------------------------------------------------- */
+		/* Spin-Up & Stall Recovery Kick: 0% ESC reset -> 50% PWM kick       */
+		/* ----------------------------------------------------------------- */
+		enum {
+			KICK_STATE_IDLE = 0,
+			KICK_STATE_RESET_WAIT = 1,
+			KICK_STATE_KICKING = 2,
+		};
+		static uint8_t s_kick_state = KICK_STATE_IDLE;
+		static int64_t s_kick_state_start_ms = 0;
+		static int64_t s_last_kick_retry_ms = 0;
+		static int64_t s_zero_pwm_since_ms = 0;
+
+		if (target_duty > 0) {
+			if (s_kick_state == KICK_STATE_IDLE) {
+				if (rpm == 0 && raw_rpm == 0) {
+					bool already_reset = (CONFIG_APP_MOTOR_KICK_RESET_MS == 0) ||
+						(s_zero_pwm_since_ms > 0 &&
+						 (now_ms - s_zero_pwm_since_ms) >= (int64_t)CONFIG_APP_MOTOR_KICK_RESET_MS);
+					if (already_reset) {
+						if (now_ms - s_last_kick_retry_ms > 500LL) {
+							s_kick_state = KICK_STATE_KICKING;
+							s_kick_state_start_ms = now_ms;
+							printk("[APP_CPU] Motor Kick/Stall Recovery Started: target=%u%% -> applying %u%% until spinning\n",
+							       target_duty, (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT);
+						}
+					} else {
+						s_kick_state = KICK_STATE_RESET_WAIT;
+						s_kick_state_start_ms = now_ms;
+						printk("[APP_CPU] Motor Stall Detected: target=%u%% -> holding 0%% for %d ms to reset ESC latch\n",
+						       target_duty, CONFIG_APP_MOTOR_KICK_RESET_MS);
+					}
+				}
+			} else if (s_kick_state == KICK_STATE_RESET_WAIT) {
+				if (raw_rpm > 0U || delta_pulses > 0U) {
+					s_kick_state = KICK_STATE_IDLE;
+				} else if ((now_ms - s_kick_state_start_ms) >= (int64_t)CONFIG_APP_MOTOR_KICK_RESET_MS) {
+					s_kick_state = KICK_STATE_KICKING;
+					s_kick_state_start_ms = now_ms;
+					printk("[APP_CPU] Motor Kick/Stall Recovery Started: target=%u%% -> applying %u%% until spinning\n",
+					       target_duty, (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT);
+				}
+			} else if (s_kick_state == KICK_STATE_KICKING) {
+				int64_t kick_duration = now_ms - s_kick_state_start_ms;
+				/* Require at least 400ms kick duration so rotor overcomes inertia */
+				if (kick_duration >= 400LL && (raw_rpm >= 300U || delta_pulses >= 2U)) {
+					s_kick_state = KICK_STATE_IDLE;
+					s_last_kick_retry_ms = now_ms;
+					printk("[APP_CPU] Motor Kick Succeeded: raw_rpm=%u, ema=%u (took %lld ms) -> resuming target=%u%%\n",
+					       raw_rpm, rpm, (long long)kick_duration, target_duty);
+				} else if (kick_duration > 3000LL) {
+					/* Timeout after 3.0s to protect mechanically jammed motor */
+					s_last_kick_retry_ms = now_ms;
+					if (CONFIG_APP_MOTOR_KICK_RESET_MS > 0) {
+						s_kick_state = KICK_STATE_RESET_WAIT;
+						s_kick_state_start_ms = now_ms;
+						printk("[APP_CPU] Motor Kick Timeout (3s, rpm=0) -> resetting PWM to 0%% for %d ms before retry\n",
+						       CONFIG_APP_MOTOR_KICK_RESET_MS);
+					} else {
+						s_kick_state = KICK_STATE_IDLE;
+						printk("[APP_CPU] Motor Kick Timeout (3s, rpm=0) -> yielding to target=%u%% before retry\n", target_duty);
+					}
+				}
+			}
+		} else {
+			s_kick_state = KICK_STATE_IDLE;
+		}
+
+		/* Apply 0% during ESC reset wait, >=CONFIG_APP_MOTOR_KICK_PWM_PCT while kicking, otherwise target_duty */
+		uint32_t effective_duty = target_duty;
+		if (s_kick_state == KICK_STATE_RESET_WAIT) {
+			effective_duty = 0U;
+		} else if (s_kick_state == KICK_STATE_KICKING) {
+			effective_duty = (target_duty < (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT)
+				? (uint32_t)CONFIG_APP_MOTOR_KICK_PWM_PCT
+				: target_duty;
+		}
+
+		if (effective_duty == 0U) {
+			if (s_zero_pwm_since_ms == 0) {
+				s_zero_pwm_since_ms = now_ms;
+			}
+		} else {
+			s_zero_pwm_since_ms = 0;
+		}
+
+		/* ----------------------------------------------------------------- */
 		/* Dry-Run / Air-Draw PWM Throttling State Machine                   */
 		/* ----------------------------------------------------------------- */
 		static uint8_t  s_throt_state = THROTTLE_STATE_NORMAL;
@@ -489,7 +575,7 @@ static void motor_speed_thread_fn(void *arg1, void *arg2, void *arg3)
 		static uint8_t  s_trig_hits = 0;
 		static int64_t  s_hold_until_ms = 0;
 
-		uint32_t unthrottled_duty = target_duty;
+		uint32_t unthrottled_duty = effective_duty;
 		int32_t cur_ma = g_disp_current_ma;
 
 		if (!throt_cfg.enabled || unthrottled_duty == 0) {
