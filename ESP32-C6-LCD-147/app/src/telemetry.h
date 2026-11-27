@@ -66,12 +66,12 @@ typedef struct {
 #define CONFIG_APP_DEFAULT_P_HIGH_PCT 80
 #endif
 
-#define DEFAULT_PROF_T_LOW   410
+#define DEFAULT_PROF_T_LOW   0
 #define DEFAULT_PROF_P_LOW   0
-#define DEFAULT_PROF_T_UP    10
-#define DEFAULT_PROF_T_HIGH  170
+#define DEFAULT_PROF_T_UP    0
+#define DEFAULT_PROF_T_HIGH  90
 #define DEFAULT_PROF_P_HIGH  CONFIG_APP_DEFAULT_P_HIGH_PCT
-#define DEFAULT_PROF_T_DROP  10
+#define DEFAULT_PROF_T_DROP  0
 #define DEFAULT_PROF_TOTAL   (DEFAULT_PROF_T_LOW + DEFAULT_PROF_T_UP + DEFAULT_PROF_T_HIGH + DEFAULT_PROF_T_DROP)
 
 #define APP_MAX_CURRENT_MA   150
@@ -86,8 +86,6 @@ typedef struct __attribute__((packed)) {
 	uint8_t  action;               /* PWM_ACTION_*                        */
 	uint8_t  manual_pwm;           /* 0..100% when action == PWM_ACTION_MANUAL_PWM */
 } pwm_profile_ctrl_t;
-
-typedef pwm_profile_ctrl_t ipm_pwm_ctrl_t;
 
 #define DEFAULT_THROTTLE_ENABLED        1
 #define DEFAULT_THROTTLE_MAX_DROP_PCT   60
@@ -114,21 +112,24 @@ typedef struct __attribute__((packed)) {
 #endif
 
 #ifndef CONFIG_APP_CAL_SETTLE_MS
-#define CONFIG_APP_CAL_SETTLE_MS 3000
+#define CONFIG_APP_CAL_SETTLE_MS 3500
 #endif
 
 #ifndef CONFIG_APP_OP_SETTLE_MS
-#define CONFIG_APP_OP_SETTLE_MS 2000
+#define CONFIG_APP_OP_SETTLE_MS 3500
 #endif
 
 #define AIR_CAL_MIN_PCT     10
 #define AIR_CAL_STEP_PCT    5
 #define AIR_CAL_POINTS      19 /* 10%, 15%, 20%, ..., 100% */
+#define AIR_CAL_TOTAL_STEPS (AIR_CAL_POINTS + AIR_CAL_POINTS - 1) /* 19 up (10..100) + 18 down (95..10) = 37 steps */
 
 typedef struct {
 	uint8_t  pwm_pct;
-	uint16_t rpm;
-	uint32_t power_mw;
+	uint16_t rpm_up;
+	uint32_t power_up;
+	uint16_t rpm_down;
+	uint32_t power_down;
 } air_cal_point_t;
 
 typedef struct {
@@ -137,10 +138,24 @@ typedef struct {
 	air_cal_point_t pts[AIR_CAL_POINTS];
 } air_cal_data_t;
 
+#define DEFAULT_CL_ENABLED          1
+#define DEFAULT_CL_TARGET_MAX_PCT   85
+#define DEFAULT_CL_LOWER_CLIP_PCT   25
+#define DEFAULT_CL_START_PWM_PCT    70
+#define DEFAULT_CL_CHECK_UP_SEC     2
+#define DEFAULT_CL_CHECK_DOWN_SEC   2
+#define DEFAULT_CL_GAIN_UP_PCT      5
+#define DEFAULT_CL_GAIN_DOWN_PCT    5
+#define DEFAULT_CL_UP_THRESH_PCT    50
+#define DEFAULT_CL_DN_THRESH_PCT    25
+#define DEFAULT_CL_CAL_RPM_SHIFT    0
+#define DEFAULT_CL_CAL_PWR_SHIFT    0
+#define DEFAULT_CL_RPM_DROP_PCT     3
+
 typedef struct {
 	uint8_t  enabled;          /* 1=closed-loop in HIGH stage, 0=fixed p_high_pct */
-	uint16_t target_max_rpm;   /* target max RPM when drawing water */
-	uint16_t lower_rpm_clip;   /* clip PWM to 0% if RPM <= this in drop/air */
+	uint8_t  target_max_pct;   /* target max speed as % of max RPM (default 85%) */
+	uint8_t  lower_clip_pct;   /* clip PWM to 0% if speed <= this % of max RPM (default 25%) */
 	uint8_t  start_pwm_pct;    /* initial test PWM at start of HIGH stage */
 	uint8_t  check_up_sec;     /* seconds between speed-up checks */
 	uint8_t  check_down_sec;   /* seconds between speed-down checks */

@@ -108,7 +108,7 @@ config APP_CAL_SETTLE_MS
 
 config APP_OP_SETTLE_MS
 	int "Closed-Loop Operation Settle Time (ms)"
-	default 2000
+	default 3500
 	range 200 30000
 	help
 	  Time in milliseconds to wait after a PWM change or stage start before
